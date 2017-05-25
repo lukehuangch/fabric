@@ -17,6 +17,7 @@ limitations under the License.
 package mock
 
 import (
+	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/comm"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/util"
@@ -152,9 +153,16 @@ func (mock *commMock) Send(msg *proto.SignedGossipMessage, peers ...*comm.Remote
 	}
 }
 
-// Probe probes a remote node and returns nil if its responsive
+// Probe probes a remote node and returns nil if its responsive,
+// and an error if it's not.
 func (mock *commMock) Probe(peer *comm.RemotePeer) error {
 	return nil
+}
+
+// Handshake authenticates a remote peer and returns
+// (its identity, nil) on success and (nil, error)
+func (mock *commMock) Handshake(peer *comm.RemotePeer) (api.PeerIdentityType, error) {
+	return nil, nil
 }
 
 // Accept returns a dedicated read-only channel for messages sent by other nodes that match a certain predicate.
@@ -183,9 +191,4 @@ func (mock *commMock) Stop() {
 	}
 	logger.Debug("[XXX]: Sending done signal to close the module.")
 	mock.done <- struct{}{}
-}
-
-// BlackListPKIid prohibits the module communicating with the given PKIid
-func (mock *commMock) BlackListPKIid(PKIid common.PKIidType) {
-	// NOOP
 }

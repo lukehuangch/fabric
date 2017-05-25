@@ -1,3 +1,19 @@
+/*
+Copyright IBM Corp. 2016 All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+		 http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package util
 
 import (
@@ -7,7 +23,16 @@ import (
 	"testing"
 	"time"
 
+	"archive/tar"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
 	"github.com/hyperledger/fabric/common/util"
+	"github.com/hyperledger/fabric/core/config"
+	cutil "github.com/hyperledger/fabric/core/container/util"
+	"github.com/spf13/viper"
 )
 
 // TestHashContentChange changes a random byte in a content and checks for hash change
@@ -170,4 +195,50 @@ func TestHashSameDir(t *testing.T) {
 	if bytes.Compare(hash1, hash2) != 0 {
 		t.Error("Hash should be same across multiple downloads")
 	}
+}
+
+func TestDockerPull(t *testing.T) {
+	codepackage, output := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(output)
+
+		tw.Close()
+		output.Close()
+	}()
+
+	binpackage := bytes.NewBuffer(nil)
+
+	// Perform a nop operation within a fixed target.  We choose 1.0.0-alpha2 because we know it's
+	// published and available.  Ideally we could choose something that we know is both multi-arch
+	// and ok to delete prior to executing DockerBuild.  This would ensure that we exercise the
+	// image pull logic.  However, no suitable target exists that meets all the criteria.  Therefore
+	// we settle on using a known released image.  We don't know if the image is already
+	// downloaded per se, and we don't want to explicitly delete this particular image first since
+	// it could be in use legitimately elsewhere.  Instead, we just know that this should always
+	// work and call that "close enough".
+	//
+	// Future considerations: publish a known dummy image that is multi-arch and free to randomly
+	// delete, and use that here instead.
+	err := DockerBuild(DockerBuildOptions{
+		Image:        cutil.ParseDockerfileTemplate("hyperledger/fabric-ccenv:$(ARCH)-1.0.0-alpha2"),
+		Cmd:          "/bin/true",
+		InputStream:  codepackage,
+		OutputStream: binpackage,
+	})
+	if err != nil {
+		t.Errorf("Error during build: %s", err)
+	}
+}
+
+func TestMain(m *testing.M) {
+	viper.SetConfigName("core")
+	viper.SetEnvPrefix("CORE")
+	config.AddDevConfigPath(nil)
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+	if err := viper.ReadInConfig(); err != nil {
+		fmt.Printf("could not read config %s\n", err)
+		os.Exit(-1)
+	}
+	os.Exit(m.Run())
 }

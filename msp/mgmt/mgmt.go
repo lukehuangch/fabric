@@ -17,13 +17,16 @@ limitations under the License.
 package mgmt
 
 import (
+	"reflect"
 	"sync"
 
 	"errors"
 
 	"github.com/hyperledger/fabric/bccsp/factory"
+	configvaluesmsp "github.com/hyperledger/fabric/common/config/msp"
+	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/msp"
-	"github.com/op/go-logging"
 )
 
 // LoadLocalMsp loads the local MSP from the specified directory
@@ -40,6 +43,16 @@ func LoadLocalMsp(dir string, bccspConfig *factory.FactoryOpts, mspID string) er
 	return GetLocalMSP().Setup(conf)
 }
 
+// Loads the development local MSP for use in testing.  Not valid for production/runtime context
+func LoadDevMsp() error {
+	mspDir, err := config.GetDevMspDir()
+	if err != nil {
+		return err
+	}
+
+	return LoadLocalMsp(mspDir, nil, "DEFAULT")
+}
+
 // FIXME: AS SOON AS THE CHAIN MANAGEMENT CODE IS COMPLETE,
 // THESE MAPS AND HELPSER FUNCTIONS SHOULD DISAPPEAR BECAUSE
 // OWNERSHIP OF PER-CHAIN MSP MANAGERS WILL BE HANDLED BY IT;
@@ -48,7 +61,7 @@ func LoadLocalMsp(dir string, bccspConfig *factory.FactoryOpts, mspID string) er
 var m sync.Mutex
 var localMsp msp.MSP
 var mspMap map[string]msp.MSPManager = make(map[string]msp.MSPManager)
-var mspLogger = logging.MustGetLogger("msp")
+var mspLogger = flogging.MustGetLogger("msp")
 
 // GetManagerForChain returns the msp manager for the supplied
 // chain; if no such manager exists, one is created
@@ -62,33 +75,42 @@ func GetManagerForChain(chainID string) msp.MSPManager {
 		mspMgr = msp.NewMSPManager()
 		mspMap[chainID] = mspMgr
 	} else {
-		mspLogger.Debugf("Returning existing manager for chain %s", chainID)
+		switch mgr := mspMgr.(type) {
+		case *configvaluesmsp.MSPConfigHandler:
+			// check for nil MSPManager interface as it can exist but not be
+			// instantiated
+			if mgr.MSPManager == nil {
+				mspLogger.Debugf("MSPManager is not instantiated; no MSPs are defined for this channel.")
+				// return nil so the MSPManager methods cannot be accidentally called,
+				// which would result in a panic
+				return nil
+			}
+		default:
+			// check for internal mspManagerImpl type. if a different type is found,
+			// it's because a developer has added a new type that implements the
+			// MSPManager interface and should add a case to the logic above to handle
+			// it.
+			if reflect.TypeOf(mgr).Elem().Name() != "mspManagerImpl" {
+				panic("Found unexpected MSPManager type.")
+			}
+		}
+		mspLogger.Debugf("Returning existing manager for channel '%s'", chainID)
 	}
-
 	return mspMgr
 }
 
 // GetManagers returns all the managers registered
-func GetManagers() map[string]msp.MSPManager {
+func GetDeserializers() map[string]msp.IdentityDeserializer {
 	m.Lock()
 	defer m.Unlock()
 
-	clone := make(map[string]msp.MSPManager)
+	clone := make(map[string]msp.IdentityDeserializer)
 
 	for key, mspManager := range mspMap {
 		clone[key] = mspManager
 	}
 
 	return clone
-}
-
-// GetManagerForChainIfExists returns the MSPManager associated to ChainID
-// it it exists
-func GetManagerForChainIfExists(ChainID string) msp.MSPManager {
-	m.Lock()
-	defer m.Unlock()
-
-	return mspMap[ChainID]
 }
 
 // XXXSetMSPManager is a stopgap solution to transition from the custom MSP config block

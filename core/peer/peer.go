@@ -17,14 +17,17 @@ limitations under the License.
 package peer
 
 import (
+	"errors"
 	"fmt"
-	"math"
 	"net"
 	"sync"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric/common/config"
 	"github.com/hyperledger/fabric/common/configtx"
 	configtxapi "github.com/hyperledger/fabric/common/configtx/api"
-	configvaluesapi "github.com/hyperledger/fabric/common/configvalues"
+	configtxtest "github.com/hyperledger/fabric/common/configtx/test"
+	"github.com/hyperledger/fabric/common/flogging"
 	mockconfigtx "github.com/hyperledger/fabric/common/mocks/configtx"
 	mockpolicies "github.com/hyperledger/fabric/common/mocks/policies"
 	"github.com/hyperledger/fabric/common/policies"
@@ -33,26 +36,37 @@ import (
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/ledgermgmt"
+	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/service"
+	"github.com/hyperledger/fabric/msp"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
 	"github.com/hyperledger/fabric/protos/common"
+	mspprotos "github.com/hyperledger/fabric/protos/msp"
 	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protos/utils"
-	"github.com/op/go-logging"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 )
 
-var peerLogger = logging.MustGetLogger("peer")
+var peerLogger = flogging.MustGetLogger("peer")
+
+var peerServer comm.GRPCServer
+
+// singleton instance to manage CAs for the peer across channel config changes
+var rootCASupport = comm.GetCASupport()
 
 type chainSupport struct {
 	configtxapi.Manager
-	configvaluesapi.Application
+	config.Application
 	ledger ledger.PeerLedger
 }
 
 func (cs *chainSupport) Ledger() ledger.PeerLedger {
 	return cs.ledger
+}
+
+func (cs *chainSupport) GetMSPIDs(cid string) []string {
+	return GetMSPIDs(cid)
 }
 
 // chain is a local struct to manage objects in a chain
@@ -77,6 +91,12 @@ func MockInitialize() {
 }
 
 var chainInitializer func(string)
+
+var mockMSPIDGetter func(string) []string
+
+func MockSetMSPIDGetter(mspIDGetter func(string) []string) {
+	mockMSPIDGetter = mspIDGetter
+}
 
 // Initialize sets up any chains that the peer has from the persistence. This
 // function should be called at the start up when the ledger and gossip
@@ -124,47 +144,38 @@ func InitChain(cid string) {
 }
 
 func getCurrConfigBlockFromLedger(ledger ledger.PeerLedger) (*common.Block, error) {
-	// Config blocks contain only 1 transaction, so we look for 1-tx
-	// blocks and check the transaction type
-	var envelope *common.Envelope
-	var tx *common.Payload
-	var block *common.Block
-	var err error
-	var currBlockNumber uint64 = math.MaxUint64
-	for currBlockNumber >= 0 {
-		if block, err = ledger.GetBlockByNumber(currBlockNumber); err != nil {
-			return nil, err
-		}
-		if block.Data != nil && len(block.Data.Data) == 1 {
-			if envelope, err = utils.ExtractEnvelope(block, 0); err != nil {
-				peerLogger.Warning("Failed to get Envelope from Block %d.", block.Header.Number)
-				currBlockNumber = block.Header.Number - 1
-				continue
-			}
-			if tx, err = utils.ExtractPayload(envelope); err != nil {
-				peerLogger.Warning("Failed to get Payload from Block %d.", block.Header.Number)
-				currBlockNumber = block.Header.Number - 1
-				continue
-			}
-			chdr, err := utils.UnmarshalChannelHeader(tx.Header.ChannelHeader)
-			if err != nil {
-				peerLogger.Warning("Failed to get ChannelHeader from Block %d, error %s.", block.Header.Number, err)
-				currBlockNumber = block.Header.Number - 1
-				continue
-			}
-			if chdr.Type == int32(common.HeaderType_CONFIG) {
-				return block, nil
-			}
-		}
-		currBlockNumber = block.Header.Number - 1
+	peerLogger.Debugf("Getting config block")
+
+	// get last block.  Last block number is Height-1
+	blockchainInfo, err := ledger.GetBlockchainInfo()
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("Failed to find config block.")
+	lastBlock, err := ledger.GetBlockByNumber(blockchainInfo.Height - 1)
+	if err != nil {
+		return nil, err
+	}
+
+	// get most recent config block location from last block metadata
+	configBlockIndex, err := utils.GetLastConfigIndexFromBlock(lastBlock)
+	if err != nil {
+		return nil, err
+	}
+
+	// get most recent config block
+	configBlock, err := ledger.GetBlockByNumber(configBlockIndex)
+	if err != nil {
+		return nil, err
+	}
+
+	peerLogger.Debugf("Got config block[%d]", configBlockIndex)
+	return configBlock, nil
 }
 
 // createChain creates a new chain object and insert it into the chains
 func createChain(cid string, ledger ledger.PeerLedger, cb *common.Block) error {
 
-	configEnvelope, err := configtx.ConfigEnvelopeFromBlock(cb)
+	envelopeConfig, err := utils.ExtractEnvelope(cb, 0)
 	if err != nil {
 		return err
 	}
@@ -178,12 +189,23 @@ func createChain(cid string, ledger ledger.PeerLedger, cb *common.Block) error {
 			Manager:     cm,
 			Application: configtxInitializer.ApplicationConfig(),
 		})
+		service.GetGossipService().SuspectPeers(func(identity api.PeerIdentityType) bool {
+			// TODO: this is a place-holder that would somehow make the MSP layer suspect
+			// that a given certificate is revoked, or its intermediate CA is revoked.
+			// In the meantime, before we have such an ability, we return true in order
+			// to suspect ALL identities in order to validate all of them.
+			return true
+		})
+	}
+
+	trustedRootsCallbackWrapper := func(cm configtxapi.Manager) {
+		updateTrustedRoots(cm)
 	}
 
 	configtxManager, err := configtx.NewManagerImpl(
-		configEnvelope,
+		envelopeConfig,
 		configtxInitializer,
-		[]func(cm configtxapi.Manager){gossipCallbackWrapper},
+		[]func(cm configtxapi.Manager){gossipCallbackWrapper, trustedRootsCallbackWrapper},
 	)
 	if err != nil {
 		return err
@@ -199,7 +221,11 @@ func createChain(cid string, ledger ledger.PeerLedger, cb *common.Block) error {
 	}
 
 	c := committer.NewLedgerCommitter(ledger, txvalidator.NewTxValidator(cs))
-	service.GetGossipService().InitializeChannel(cs.ChainID(), c)
+	ordererAddresses := configtxManager.ChannelConfig().OrdererAddresses()
+	if len(ordererAddresses) == 0 {
+		return errors.New("No orderering service endpoint provided in configuration block")
+	}
+	service.GetGossipService().InitializeChannel(cs.ChainID(), c, ordererAddresses)
 
 	chains.Lock()
 	defer chains.Unlock()
@@ -217,16 +243,13 @@ func CreateChainFromBlock(cb *common.Block) error {
 	if err != nil {
 		return err
 	}
-	var ledger ledger.PeerLedger
-	if ledger, err = createLedger(cid); err != nil {
-		return err
+
+	var l ledger.PeerLedger
+	if l, err = ledgermgmt.CreateLedger(cb); err != nil {
+		return fmt.Errorf("Cannot create ledger from genesis block, due to %s", err)
 	}
 
-	if err := ledger.Commit(cb); err != nil {
-		peerLogger.Errorf("Unable to get genesis block committed into the ledger, chainID %v", cid)
-		return err
-	}
-	return createChain(cid, ledger, cb)
+	return createChain(cid, l, cb)
 }
 
 // MockCreateChain used for creating a ledger for a chain for tests
@@ -234,25 +257,40 @@ func CreateChainFromBlock(cb *common.Block) error {
 func MockCreateChain(cid string) error {
 	var ledger ledger.PeerLedger
 	var err error
-	if ledger, err = createLedger(cid); err != nil {
-		return err
+
+	if ledger = GetLedger(cid); ledger == nil {
+		gb, _ := configtxtest.MakeGenesisBlock(cid)
+		if ledger, err = ledgermgmt.CreateLedger(gb); err != nil {
+			return err
+		}
 	}
 
-	i := mockconfigtx.Initializer{
+	// Here we need to mock also the policy manager
+	// in order for the ACL to be checked
+	initializer := mockconfigtx.Initializer{
 		Resources: mockconfigtx.Resources{
 			PolicyManagerVal: &mockpolicies.Manager{
 				Policy: &mockpolicies.Policy{},
 			},
 		},
+		PolicyProposerVal: &mockconfigtx.PolicyProposer{
+			Transactional: mockconfigtx.Transactional{},
+		},
+		ValueProposerVal: &mockconfigtx.ValueProposer{
+			Transactional: mockconfigtx.Transactional{},
+		},
+	}
+	manager := &mockconfigtx.Manager{
+		Initializer: initializer,
 	}
 
 	chains.Lock()
 	defer chains.Unlock()
+
 	chains.list[cid] = &chain{
 		cs: &chainSupport{
-			ledger:  ledger,
-			Manager: &mockconfigtx.Manager{Initializer: i},
-		},
+			Manager: manager,
+			ledger:  ledger},
 	}
 
 	return nil
@@ -291,6 +329,141 @@ func GetCurrConfigBlock(cid string) *common.Block {
 	return nil
 }
 
+// updates the trusted roots for the peer based on updates to channels
+func updateTrustedRoots(cm configtxapi.Manager) {
+	// this is triggered on per channel basis so first update the roots for the channel
+	peerLogger.Debugf("Updating trusted root authorities for channel %s", cm.ChainID())
+	var secureConfig comm.SecureServerConfig
+	var err error
+	// only run is TLS is enabled
+	secureConfig, err = GetSecureConfig()
+	if err == nil && secureConfig.UseTLS {
+		buildTrustedRootsForChain(cm)
+
+		// now iterate over all roots for all app and orderer chains
+		trustedRoots := [][]byte{}
+		rootCASupport.RLock()
+		defer rootCASupport.RUnlock()
+		for _, roots := range rootCASupport.AppRootCAsByChain {
+			trustedRoots = append(trustedRoots, roots...)
+		}
+		// also need to append statically configured root certs
+		if len(secureConfig.ClientRootCAs) > 0 {
+			trustedRoots = append(trustedRoots, secureConfig.ClientRootCAs...)
+		}
+		if len(secureConfig.ServerRootCAs) > 0 {
+			trustedRoots = append(trustedRoots, secureConfig.ServerRootCAs...)
+		}
+
+		server := GetPeerServer()
+		// now update the client roots for the peerServer
+		if server != nil {
+			err := server.SetClientRootCAs(trustedRoots)
+			if err != nil {
+				msg := "Failed to update trusted roots for peer from latest config " +
+					"block.  This peer may not be able to communicate " +
+					"with members of channel %s (%s)"
+				peerLogger.Warningf(msg, cm.ChainID(), err)
+			}
+		}
+	}
+}
+
+// populates the appRootCAs and orderRootCAs maps by getting the
+// root and intermediate certs for all msps associated with the MSPManager
+func buildTrustedRootsForChain(cm configtxapi.Manager) {
+	rootCASupport.Lock()
+	defer rootCASupport.Unlock()
+
+	appRootCAs := [][]byte{}
+	ordererRootCAs := [][]byte{}
+	appOrgMSPs := make(map[string]struct{})
+
+	//loop through app orgs and build map of MSPIDs
+	for _, appOrg := range cm.ApplicationConfig().Organizations() {
+		appOrgMSPs[appOrg.MSPID()] = struct{}{}
+	}
+	cid := cm.ChainID()
+	peerLogger.Debugf("updating root CAs for channel [%s]", cid)
+	msps, err := cm.MSPManager().GetMSPs()
+	if err != nil {
+		peerLogger.Errorf("Error getting root CAs for channel %s (%s)", cid, err)
+	}
+	if err == nil {
+		for k, v := range msps {
+			// check to see if this is a FABRIC MSP
+			if v.GetType() == msp.FABRIC {
+				for _, root := range v.GetRootCerts() {
+					sid, err := root.Serialize()
+					if err == nil {
+						id := &mspprotos.SerializedIdentity{}
+						err = proto.Unmarshal(sid, id)
+						if err == nil {
+							// check to see of this is an app org MSP
+							if _, ok := appOrgMSPs[k]; ok {
+								peerLogger.Debugf("adding app root CAs for MSP [%s]", k)
+								appRootCAs = append(appRootCAs, id.IdBytes)
+							} else {
+								peerLogger.Debugf("adding orderer root CAs for MSP [%s]", k)
+								ordererRootCAs = append(ordererRootCAs, id.IdBytes)
+							}
+						}
+					}
+				}
+				for _, intermediate := range v.GetIntermediateCerts() {
+					sid, err := intermediate.Serialize()
+					if err == nil {
+						id := &mspprotos.SerializedIdentity{}
+						err = proto.Unmarshal(sid, id)
+						if err == nil {
+							// check to see of this is an app org MSP
+							if _, ok := appOrgMSPs[k]; ok {
+								peerLogger.Debugf("adding app root CAs for MSP [%s]", k)
+								appRootCAs = append(appRootCAs, id.IdBytes)
+							} else {
+								peerLogger.Debugf("adding orderer root CAs for MSP [%s]", k)
+								ordererRootCAs = append(ordererRootCAs, id.IdBytes)
+							}
+						}
+					}
+				}
+			}
+		}
+		rootCASupport.AppRootCAsByChain[cid] = appRootCAs
+		rootCASupport.OrdererRootCAsByChain[cid] = ordererRootCAs
+	}
+}
+
+// GetMSPIDs returns the ID of each application MSP defined on this chain
+func GetMSPIDs(cid string) []string {
+	chains.RLock()
+	defer chains.RUnlock()
+
+	//if mock is set, use it to return MSPIDs
+	//used for tests without a proper join
+	if mockMSPIDGetter != nil {
+		return mockMSPIDGetter(cid)
+	}
+	if c, ok := chains.list[cid]; ok {
+		if c == nil || c.cs == nil ||
+			c.cs.ApplicationConfig() == nil ||
+			c.cs.ApplicationConfig().Organizations() == nil {
+			return nil
+		}
+
+		orgs := c.cs.ApplicationConfig().Organizations()
+		toret := make([]string, len(orgs))
+		i := 0
+		for _, org := range orgs {
+			toret[i] = org.MSPID()
+			i++
+		}
+
+		return toret
+	}
+	return nil
+}
+
 // SetCurrConfigBlock sets the current config block of the specified chain
 func SetCurrConfigBlock(block *common.Block, cid string) error {
 	chains.Lock()
@@ -304,15 +477,6 @@ func SetCurrConfigBlock(block *common.Block, cid string) error {
 		return nil
 	}
 	return fmt.Errorf("Chain %s doesn't exist on the peer", cid)
-}
-
-// All ledgers are located under `peer.fileSystemPath`
-func createLedger(cid string) (ledger.PeerLedger, error) {
-	var ledger ledger.PeerLedger
-	if ledger = GetLedger(cid); ledger != nil {
-		return ledger, nil
-	}
-	return ledgermgmt.CreateLedger(cid)
 }
 
 // NewPeerClientConnection Returns a new grpc.ClientConn to the configured local PEER.
@@ -363,40 +527,33 @@ func GetChannelsInfo() []*pb.ChannelInfo {
 	return channelInfoArray
 }
 
-// GetPolicyManagerMgmt returns a special PolicyManager whose
-// only function is to give access to the policy manager of
-// a given channel. If the channel does not exists then,
-// it returns nil.
-// The only method implemented is therefore 'Manager'.
-func GetPolicyManagerMgmt() policies.Manager {
-	return &policyManagerMgmt{}
+// NewChannelPolicyManagerGetter returns a new instance of ChannelPolicyManagerGetter
+func NewChannelPolicyManagerGetter() policies.ChannelPolicyManagerGetter {
+	return &channelPolicyManagerGetter{}
 }
 
-type policyManagerMgmt struct{}
+type channelPolicyManagerGetter struct{}
 
-func (c *policyManagerMgmt) GetPolicy(id string) (policies.Policy, bool) {
-	panic("implement me")
-}
-
-// Manager returns the policy manager associated to a channel
-// specified by a path of length 1 that has the name of the channel as the only
-// coordinate available.
-// If the path has length different from 1, then the method returns (nil, false).
-// If the channel does not exists, then the method returns (nil, false)
-// Nothing is created.
-func (c *policyManagerMgmt) Manager(path []string) (policies.Manager, bool) {
-	if len(path) != 1 {
-		return nil, false
-	}
-
-	policyManager := GetPolicyManager(path[0])
+func (c *channelPolicyManagerGetter) Manager(channelID string) (policies.Manager, bool) {
+	policyManager := GetPolicyManager(channelID)
 	return policyManager, policyManager != nil
 }
 
-func (c *policyManagerMgmt) BasePath() string {
-	panic("implement me")
+// CreatePeerServer creates an instance of comm.GRPCServer
+// This server is used for peer communications
+func CreatePeerServer(listenAddress string,
+	secureConfig comm.SecureServerConfig) (comm.GRPCServer, error) {
+
+	var err error
+	peerServer, err = comm.NewGRPCServer(listenAddress, secureConfig)
+	if err != nil {
+		peerLogger.Errorf("Failed to create peer server (%s)", err)
+		return nil, err
+	}
+	return peerServer, nil
 }
 
-func (c *policyManagerMgmt) PolicyNames() []string {
-	panic("implement me")
+// GetPeerServer returns the peer server instance
+func GetPeerServer() comm.GRPCServer {
+	return peerServer
 }

@@ -61,9 +61,9 @@ func newCertStore(puller pull.Mediator, idMapper identity.Mapper, selfIdentity a
 	}
 
 	puller.Add(certStore.createIdentityMessage())
-	puller.RegisterMsgHook(pull.ResponseMsgType, func(_ []string, msgs []*proto.SignedGossipMessage, _ proto.ReceivedMessage) {
+	puller.RegisterMsgHook(pull.RequestMsgType, func(_ []string, msgs []*proto.SignedGossipMessage, _ proto.ReceivedMessage) {
 		for _, msg := range msgs {
-			pkiID := common.PKIidType(msg.GetPeerIdentity().PkiID)
+			pkiID := common.PKIidType(msg.GetPeerIdentity().PkiId)
 			cert := api.PeerIdentityType(msg.GetPeerIdentity().Cert)
 			if err := certStore.idMapper.Put(pkiID, cert); err != nil {
 				certStore.logger.Warning("Failed adding identity", cert, ", reason:", err)
@@ -99,7 +99,7 @@ func (cs *certStore) validateIdentityMsg(msg *proto.SignedGossipMessage) error {
 	if idMsg == nil {
 		return fmt.Errorf("Identity empty: %+v", msg)
 	}
-	pkiID := idMsg.PkiID
+	pkiID := idMsg.PkiId
 	cert := idMsg.Cert
 	calculatedPKIID := cs.mcs.GetPKIidOfCert(api.PeerIdentityType(cert))
 	claimedPKIID := common.PKIidType(pkiID)
@@ -123,7 +123,7 @@ func (cs *certStore) createIdentityMessage() *proto.SignedGossipMessage {
 	identity := &proto.PeerIdentity{
 		Cert:     cs.selfIdentity,
 		Metadata: nil,
-		PkiID:    cs.idMapper.GetPKIidOfCert(cs.selfIdentity),
+		PkiId:    cs.idMapper.GetPKIidOfCert(cs.selfIdentity),
 	}
 	m := &proto.GossipMessage{
 		Channel: nil,
@@ -141,6 +141,14 @@ func (cs *certStore) createIdentityMessage() *proto.SignedGossipMessage {
 	}
 	sMsg.Sign(signer)
 	return sMsg
+}
+
+func (cs *certStore) listRevokedPeers(isSuspected api.PeerSuspector) []common.PKIidType {
+	revokedPeers := cs.idMapper.ListInvalidIdentities(isSuspected)
+	for _, pkiID := range revokedPeers {
+		cs.pull.Remove(string(pkiID))
+	}
+	return revokedPeers
 }
 
 func (cs *certStore) stop() {

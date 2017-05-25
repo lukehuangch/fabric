@@ -24,11 +24,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+const fetchCmdDescription = "Fetch configuration block."
+
 func fetchCmd(cf *ChannelCmdFactory) *cobra.Command {
 	createCmd := &cobra.Command{
 		Use:   "fetch",
-		Short: "Fetch configuration block.",
-		Long:  `Fetch configuration block.`,
+		Short: fetchCmdDescription,
+		Long:  fetchCmdDescription,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return fetch(cmd, args, cf)
 		},
@@ -40,7 +42,7 @@ func fetchCmd(cf *ChannelCmdFactory) *cobra.Command {
 func fetch(cmd *cobra.Command, args []string, cf *ChannelCmdFactory) error {
 	var err error
 	if cf == nil {
-		cf, err = InitCmdFactory(false)
+		cf, err = InitCmdFactory(EndorserNotRequired, OrdererRequired)
 		if err != nil {
 			return err
 		}

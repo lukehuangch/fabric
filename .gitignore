@@ -22,6 +22,8 @@ tags
 bddtests/coverage
 # bddtest Dockerfile
 bddtests/environments/kafka/Dockerfile
+bddtests/tmp
+bddtests/volumes
 *.cov
 # Makefile dummy artifacts
 .*-dummy
@@ -29,9 +31,15 @@ bddtests/environments/kafka/Dockerfile
 go-carpet-coverage*
 # make node-sdk copied files
 sdk/node/lib/protos/*
+# Test result xml files
 report.xml
+results.xml
+TESTS*.xml
 .settings
 .project
 .gradle
 build/
 bin/
+examples/e2e_cli/channel-artifacts/*.tx
+examples/e2e_cli/channel-artifacts/*.block
+examples/e2e_cli/crypto-config/*

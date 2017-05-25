@@ -17,21 +17,21 @@ limitations under the License.
 package historyleveldb
 
 import (
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/ledger/blkstorage"
 	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/history/historydb"
-	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwset"
+	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
+	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/hyperledger/fabric/protos/common"
 	putils "github.com/hyperledger/fabric/protos/utils"
-	logging "github.com/op/go-logging"
 )
 
-var logger = logging.MustGetLogger("historyleveldb")
+var logger = flogging.MustGetLogger("historyleveldb")
 
-var compositeKeySep = []byte{0x00}
 var savePointKey = []byte{0x00}
 var emptyValue = []byte{}
 
@@ -92,9 +92,24 @@ func (historyDB *historyDB) Commit(block *common.Block) error {
 	logger.Debugf("Channel [%s]: Updating history database for blockNo [%v] with [%d] transactions",
 		historyDB.dbName, blockNo, len(block.Data.Data))
 
-	//TODO add check for invalid trans in bit array
+	// Get the invalidation byte array for the block
+	txsFilter := util.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	// Initialize txsFilter if it does not yet exist (e.g. during testing, for genesis block, etc)
+	if len(txsFilter) == 0 {
+		txsFilter = util.NewTxValidationFlags(len(block.Data.Data))
+		block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = txsFilter
+	}
+
+	// write each tran's write set to history db
 	for _, envBytes := range block.Data.Data {
-		tranNo++
+
+		// If the tran is marked as invalid, skip it
+		if txsFilter.IsInvalid(int(tranNo)) {
+			logger.Debugf("Channel [%s]: Skipping history write for invalid transaction number %d",
+				historyDB.dbName, tranNo)
+			tranNo++
+			continue
+		}
 
 		env, err := putils.GetEnvelopeFromBlock(envBytes)
 		if err != nil {
@@ -120,19 +135,19 @@ func (historyDB *historyDB) Commit(block *common.Block) error {
 			}
 
 			//preparation for extracting RWSet from transaction
-			txRWSet := &rwset.TxReadWriteSet{}
+			txRWSet := &rwsetutil.TxRwSet{}
 
 			// Get the Result from the Action and then Unmarshal
 			// it into a TxReadWriteSet using custom unmarshalling
-			if err = txRWSet.Unmarshal(respPayload.Results); err != nil {
+			if err = txRWSet.FromProtoBytes(respPayload.Results); err != nil {
 				return err
 			}
 			// for each transaction, loop through the namespaces and writesets
 			// and add a history record for each write
-			for _, nsRWSet := range txRWSet.NsRWs {
+			for _, nsRWSet := range txRWSet.NsRwSets {
 				ns := nsRWSet.NameSpace
 
-				for _, kvWrite := range nsRWSet.Writes {
+				for _, kvWrite := range nsRWSet.KvRwSet.Writes {
 					writeKey := kvWrite.Key
 
 					//composite key for history records is in the form ns~key~blockNo~tranNo
@@ -146,6 +161,7 @@ func (historyDB *historyDB) Commit(block *common.Block) error {
 		} else {
 			logger.Debugf("Skipping transaction [%d] since it is not an endorsement transaction\n", tranNo)
 		}
+		tranNo++
 	}
 
 	// add savepoint for recovery purpose

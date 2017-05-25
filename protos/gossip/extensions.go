@@ -18,9 +18,8 @@ package gossip
 
 import (
 	"bytes"
-	"fmt"
-
 	"errors"
+	"fmt"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/gossip/api"
@@ -70,14 +69,14 @@ func (mc *msgComparator) invalidationPolicy(this interface{}, that interface{}) 
 }
 
 func (mc *msgComparator) stateInvalidationPolicy(thisStateMsg *StateInfo, thatStateMsg *StateInfo) common.InvalidationResult {
-	if !bytes.Equal(thisStateMsg.PkiID, thatStateMsg.PkiID) {
+	if !bytes.Equal(thisStateMsg.PkiId, thatStateMsg.PkiId) {
 		return common.MessageNoAction
 	}
 	return compareTimestamps(thisStateMsg.Timestamp, thatStateMsg.Timestamp)
 }
 
 func (mc *msgComparator) identityInvalidationPolicy(thisIdentityMsg *PeerIdentity, thatIdentityMsg *PeerIdentity) common.InvalidationResult {
-	if bytes.Equal(thisIdentityMsg.PkiID, thatIdentityMsg.PkiID) {
+	if bytes.Equal(thisIdentityMsg.PkiId, thatIdentityMsg.PkiId) {
 		return common.MessageInvalidated
 	}
 
@@ -86,10 +85,7 @@ func (mc *msgComparator) identityInvalidationPolicy(thisIdentityMsg *PeerIdentit
 
 func (mc *msgComparator) dataInvalidationPolicy(thisDataMsg *DataMessage, thatDataMsg *DataMessage) common.InvalidationResult {
 	if thisDataMsg.Payload.SeqNum == thatDataMsg.Payload.SeqNum {
-		if thisDataMsg.Payload.Hash == thatDataMsg.Payload.Hash {
-			return common.MessageInvalidated
-		}
-		return common.MessageNoAction
+		return common.MessageInvalidated
 	}
 
 	diff := abs(thisDataMsg.Payload.SeqNum, thatDataMsg.Payload.SeqNum)
@@ -104,7 +100,7 @@ func (mc *msgComparator) dataInvalidationPolicy(thisDataMsg *DataMessage, thatDa
 }
 
 func aliveInvalidationPolicy(thisMsg *AliveMessage, thatMsg *AliveMessage) common.InvalidationResult {
-	if !bytes.Equal(thisMsg.Membership.PkiID, thatMsg.Membership.PkiID) {
+	if !bytes.Equal(thisMsg.Membership.PkiId, thatMsg.Membership.PkiId) {
 		return common.MessageNoAction
 	}
 
@@ -112,7 +108,7 @@ func aliveInvalidationPolicy(thisMsg *AliveMessage, thatMsg *AliveMessage) commo
 }
 
 func leaderInvalidationPolicy(thisMsg *LeadershipMessage, thatMsg *LeadershipMessage) common.InvalidationResult {
-	if !bytes.Equal(thisMsg.PkiID, thatMsg.PkiID) {
+	if !bytes.Equal(thisMsg.PkiId, thatMsg.PkiId) {
 		return common.MessageNoAction
 	}
 
@@ -120,14 +116,14 @@ func leaderInvalidationPolicy(thisMsg *LeadershipMessage, thatMsg *LeadershipMes
 }
 
 func compareTimestamps(thisTS *PeerTime, thatTS *PeerTime) common.InvalidationResult {
-	if thisTS.IncNumber == thatTS.IncNumber {
+	if thisTS.IncNum == thatTS.IncNum {
 		if thisTS.SeqNum > thatTS.SeqNum {
 			return common.MessageInvalidates
 		}
 
 		return common.MessageInvalidated
 	}
-	if thisTS.IncNumber < thatTS.IncNumber {
+	if thisTS.IncNum < thatTS.IncNum {
 		return common.MessageInvalidated
 	}
 	return common.MessageInvalidates
@@ -172,7 +168,7 @@ func (m *GossipMessage) IsRemoteStateMessage() bool {
 
 // GetPullMsgType returns the phase of the pull mechanism this GossipMessage belongs to
 // for example: Hello, Digest, etc.
-// If this isn't a pull message, PullMsgType_Undefined is returned.
+// If this isn't a pull message, PullMsgType_UNDEFINED is returned.
 func (m *GossipMessage) GetPullMsgType() PullMsgType {
 	if helloMsg := m.GetHello(); helloMsg != nil {
 		return helloMsg.MsgType
@@ -190,7 +186,7 @@ func (m *GossipMessage) GetPullMsgType() PullMsgType {
 		return resMsg.MsgType
 	}
 
-	return PullMsgType_Undefined
+	return PullMsgType_UNDEFINED
 }
 
 // IsChannelRestricted returns whether this GossipMessage should be routed
@@ -270,12 +266,12 @@ func (m *GossipMessage) IsTagLegal() error {
 
 	if m.IsPullMsg() {
 		switch m.GetPullMsgType() {
-		case PullMsgType_BlockMessage:
+		case PullMsgType_BLOCK_MSG:
 			if m.Tag != GossipMessage_CHAN_AND_ORG {
 				return fmt.Errorf("Tag should be %s", GossipMessage_Tag_name[int32(GossipMessage_CHAN_AND_ORG)])
 			}
 			return nil
-		case PullMsgType_IdentityMsg:
+		case PullMsgType_IDENTITY_MSG:
 			if m.Tag != GossipMessage_EMPTY {
 				return fmt.Errorf("Tag should be %s", GossipMessage_Tag_name[int32(GossipMessage_EMPTY)])
 			}
@@ -340,10 +336,18 @@ type ConnectionInfo struct {
 	ID       common.PKIidType
 	Auth     *AuthInfo
 	Identity api.PeerIdentityType
+	Endpoint string
 }
 
-func (connInfo *ConnectionInfo) IsAuthenticated() bool {
-	return connInfo.Auth != nil
+// String returns a string representation of this ConnectionInfo
+func (c *ConnectionInfo) String() string {
+	return fmt.Sprintf("%s %v", c.Endpoint, c.ID)
+}
+
+// IsAuthenticated returns whether the connection to the remote peer
+// was authenticated when the handshake took place
+func (c *ConnectionInfo) IsAuthenticated() bool {
+	return c.Auth != nil
 }
 
 // AuthInfo represents the authentication

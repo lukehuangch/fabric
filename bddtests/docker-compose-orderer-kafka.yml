@@ -1,3 +1,8 @@
+# Copyright IBM Corp. All Rights Reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
 version: '2'
 
 services:
@@ -18,7 +23,7 @@ services:
       - zookeeper
 
   orderer:
-    image: hyperledger/fabric-testenv-orderer
+    image: hyperledger/fabric-orderer
     restart: always
     environment:
       - ORDERER_GENERAL_LOGLEVEL=debug

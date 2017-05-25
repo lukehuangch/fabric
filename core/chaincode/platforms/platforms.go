@@ -27,13 +27,14 @@ import (
 
 	"io/ioutil"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/metadata"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/car"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/golang"
 	"github.com/hyperledger/fabric/core/chaincode/platforms/java"
+	"github.com/hyperledger/fabric/core/config"
 	cutil "github.com/hyperledger/fabric/core/container/util"
 	pb "github.com/hyperledger/fabric/protos/peer"
-	"github.com/op/go-logging"
 	"github.com/spf13/viper"
 )
 
@@ -47,7 +48,7 @@ type Platform interface {
 	GenerateDockerBuild(spec *pb.ChaincodeDeploymentSpec, tw *tar.Writer) error
 }
 
-var logger = logging.MustGetLogger("chaincode-platform")
+var logger = flogging.MustGetLogger("chaincode-platform")
 
 // Find returns the platform interface for the given platform type
 func Find(chaincodeType pb.ChaincodeSpec_Type) (Platform, error) {
@@ -75,17 +76,22 @@ func GetDeploymentPayload(spec *pb.ChaincodeSpec) ([]byte, error) {
 }
 
 func getPeerTLSCert() ([]byte, error) {
-	path := viper.GetString("peer.tls.cert.file")
+
+	if viper.GetBool("peer.tls.enabled") == false {
+		// no need for certificates if TLS is not enabled
+		return nil, nil
+	}
+	var path string
+	// first we check for the rootcert
+	path = config.GetPath("peer.tls.rootcert.file")
+	if path == "" {
+		// check for tls cert
+		path = config.GetPath("peer.tls.cert.file")
+	}
+	// this should not happen if the peer is running with TLS enabled
 	if _, err := os.Stat(path); err != nil {
-
-		if os.IsNotExist(err) && viper.GetBool("peer.tls.enabled") == false {
-			// It's not an error if the file doesn't exist but TLS is disabled anyway
-			return nil, nil
-		}
-
 		return nil, err
 	}
-
 	// FIXME: FAB-2037 - ensure we sanely resolve relative paths specified in the yaml
 	return ioutil.ReadFile(path)
 }
@@ -116,10 +122,13 @@ func generateDockerfile(platform Platform, cds *pb.ChaincodeDeploymentSpec, tls 
 	// ----------------------------------------------------------------------------------------------------
 	// Then augment it with any general options
 	// ----------------------------------------------------------------------------------------------------
+	//append version so chaincode build version can be campared against peer build version
+	buf = append(buf, fmt.Sprintf("ENV CORE_CHAINCODE_BUILDLEVEL=%s", metadata.Version))
+
 	if tls {
 		const guestTLSPath = "/etc/hyperledger/fabric/peer.crt"
 
-		buf = append(buf, "ENV CORE_PEER_TLS_CERT_FILE="+guestTLSPath)
+		buf = append(buf, "ENV CORE_PEER_TLS_ROOTCERT_FILE="+guestTLSPath)
 		buf = append(buf, "COPY peer.crt "+guestTLSPath)
 	}
 

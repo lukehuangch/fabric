@@ -1,9 +1,15 @@
+# Copyright IBM Corp. 2017 All Rights Reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
 import subprocess
 
 from steps.docgen import DocumentGenerator
 from steps.bdd_test_util import cli_call
 from steps.contexthelper import ContextHelper
 from steps.coverage import saveCoverageFiles, createCoverageAggregate
+from steps.bootstrap_util import getDirectory
 
 def coverageEnabled(context):
     return context.config.userdata.get("coverage", "false") == "true"
@@ -19,6 +25,11 @@ def getDockerComposeFileArgsFromYamlFile(compose_yaml):
 def before_step(context, step):
     contextHelper = ContextHelper.GetHelper(context=context)
     contextHelper.before_step(step)
+
+def after_step(context, step):
+    contextHelper = ContextHelper.GetHelper(context=context)
+    contextHelper.after_step(step)
+
 
 def before_scenario(context, scenario):
     contextHelper = ContextHelper.GetHelper(context=context)
@@ -37,7 +48,8 @@ def after_scenario(context, scenario):
         file_suffix = "_" + scenario.name.replace(" ", "_") + ".log"
         # get logs from the peer containers
         for containerData in context.compose_containers:
-            with open(containerData.containerName + file_suffix, "w+") as logfile:
+            (fileName, fileExists) = contextHelper.getTmpPathForName(name="{0}_{1}".format(containerData.containerName, scenario.name), extension="log", path_relative_to_tmp="logs")
+            with open(fileName, "w+") as logfile:
                 sys_rc = subprocess.call(["docker", "logs", containerData.containerName], stdout=logfile, stderr=logfile)
                 if sys_rc !=0 :
                     print("Cannot get logs for {0}. Docker rc = {1}".format(containerData.containerName,sys_rc))
@@ -46,7 +58,8 @@ def after_scenario(context, scenario):
             cli_call(["docker",  "ps", "-f",  "name=dev-", "--format", "{{.Names}}"], expect_success=True)
         for containerName in cc_output.splitlines():
             namePart,sep,junk = containerName.rpartition("-")
-            with open(namePart + file_suffix, "w+") as logfile:
+            (fileName, fileExists) = contextHelper.getTmpPathForName(name="{0}_{1}".format(namePart, scenario.name), extension="log", path_relative_to_tmp="logs")
+            with open(fileName, "w+") as logfile:
                 sys_rc = subprocess.call(["docker", "logs", containerName], stdout=logfile, stderr=logfile)
                 if sys_rc !=0 :
                     print("Cannot get logs for {0}. Docker rc = {1}".format(namepart,sys_rc))
@@ -61,11 +74,12 @@ def after_scenario(context, scenario):
             containerNames = [containerData.containerName for  containerData in context.compose_containers]
             saveCoverageFiles("coverage", scenario.name.replace(" ", "_"), containerNames, "cov")
         context.composition.decompose()
-
+    # Ask the directory to cleanup
+    getDirectory(context).cleanup()
 
 # stop any running peer that could get in the way before starting the tests
 def before_all(context):
-        cli_call(["../build/bin/peer", "node", "stop"], expect_success=False)
+    pass
 
 # stop any running peer that could get in the way before starting the tests
 def after_all(context):

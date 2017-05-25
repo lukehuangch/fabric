@@ -35,6 +35,7 @@ import (
 	"github.com/hyperledger/fabric/core/chaincode/platforms"
 	"github.com/hyperledger/fabric/core/chaincode/shim"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
+	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/core/container"
 	"github.com/hyperledger/fabric/core/container/api"
 	"github.com/hyperledger/fabric/core/container/ccintf"
@@ -48,7 +49,6 @@ const (
 	// DevModeUserRunsChaincode property allows user to run chaincode in development environment
 	DevModeUserRunsChaincode       string = "dev"
 	chaincodeStartupTimeoutDefault int    = 5000
-	chaincodeInstallPathDefault    string = "/opt/gopath/bin/"
 	peerAddressDefault             string = "0.0.0.0:7051"
 
 	//TXSimulatorKey is used to attach ledger simulation context
@@ -120,7 +120,7 @@ func (chaincodeSupport *ChaincodeSupport) chaincodeHasBeenLaunched(chaincode str
 
 // NewChaincodeSupport creates a new ChaincodeSupport instance
 func NewChaincodeSupport(getPeerEndpoint func() (*pb.PeerEndpoint, error), userrunsCC bool, ccstartuptimeout time.Duration) *ChaincodeSupport {
-	ccprovider.SetChaincodesPath(viper.GetString("peer.fileSystemPath") + string(filepath.Separator) + "chaincodes")
+	ccprovider.SetChaincodesPath(config.GetPath("peer.fileSystemPath") + string(filepath.Separator) + "chaincodes")
 
 	pnid := viper.GetString("peer.networkId")
 	pid := viper.GetString("peer.id")
@@ -148,8 +148,8 @@ func NewChaincodeSupport(getPeerEndpoint func() (*pb.PeerEndpoint, error), userr
 
 	theChaincodeSupport.peerTLS = viper.GetBool("peer.tls.enabled")
 	if theChaincodeSupport.peerTLS {
-		theChaincodeSupport.peerTLSCertFile = viper.GetString("peer.tls.cert.file")
-		theChaincodeSupport.peerTLSKeyFile = viper.GetString("peer.tls.key.file")
+		theChaincodeSupport.peerTLSCertFile = config.GetPath("peer.tls.cert.file")
+		theChaincodeSupport.peerTLSKeyFile = config.GetPath("peer.tls.key.file")
 		theChaincodeSupport.peerTLSSvrHostOrd = viper.GetString("peer.tls.serverhostoverride")
 	}
 
@@ -168,22 +168,41 @@ func NewChaincodeSupport(getPeerEndpoint func() (*pb.PeerEndpoint, error), userr
 		theChaincodeSupport.keepalive = time.Duration(t) * time.Second
 	}
 
+	//default chaincode execute timeout is 30 secs
+	execto := time.Duration(30) * time.Second
+	if eto := viper.GetDuration("chaincode.executetimeout"); eto <= time.Duration(1)*time.Second {
+		chaincodeLogger.Errorf("Invalid execute timeout value %s (should be at least 1s); defaulting to %s", eto, execto)
+	} else {
+		chaincodeLogger.Debugf("Setting execute timeout value to %s", eto)
+		execto = eto
+	}
+
+	theChaincodeSupport.executetimeout = execto
+
 	viper.SetEnvPrefix("CORE")
 	viper.AutomaticEnv()
 	replacer := strings.NewReplacer(".", "_")
 	viper.SetEnvKeyReplacer(replacer)
 
-	chaincodeLogLevelString := viper.GetString("logging.chaincode")
-	chaincodeLogLevel, err := logging.LogLevel(chaincodeLogLevelString)
-
-	if err == nil {
-		theChaincodeSupport.chaincodeLogLevel = chaincodeLogLevel.String()
-	} else {
-		chaincodeLogger.Warningf("Chaincode logging level %s is invalid; defaulting to %s", chaincodeLogLevelString, flogging.DefaultLevel().String())
-		theChaincodeSupport.chaincodeLogLevel = flogging.DefaultLevel().String()
-	}
+	theChaincodeSupport.chaincodeLogLevel = getLogLevelFromViper("level")
+	theChaincodeSupport.shimLogLevel = getLogLevelFromViper("shim")
+	theChaincodeSupport.logFormat = viper.GetString("chaincode.logging.format")
 
 	return theChaincodeSupport
+}
+
+// getLogLevelFromViper gets the chaincode container log levels from viper
+func getLogLevelFromViper(module string) string {
+	levelString := viper.GetString("chaincode.logging." + module)
+	_, err := logging.LogLevel(levelString)
+
+	if err == nil {
+		chaincodeLogger.Debugf("CORE_CHAINCODE_%s set to level %s", strings.ToUpper(module), levelString)
+	} else {
+		chaincodeLogger.Warningf("CORE_CHAINCODE_%s has invalid log level %s. defaulting to %s", strings.ToUpper(module), levelString, flogging.DefaultLevel())
+		levelString = flogging.DefaultLevel()
+	}
+	return levelString
 }
 
 // // ChaincodeStream standard stream for ChaincodeMessage type.
@@ -197,15 +216,18 @@ type ChaincodeSupport struct {
 	runningChaincodes *runningChaincodes
 	peerAddress       string
 	ccStartupTimeout  time.Duration
-	userRunsCC        bool
 	peerNetworkID     string
 	peerID            string
-	peerTLS           bool
 	peerTLSCertFile   string
 	peerTLSKeyFile    string
 	peerTLSSvrHostOrd string
 	keepalive         time.Duration
 	chaincodeLogLevel string
+	shimLogLevel      string
+	logFormat         string
+	executetimeout    time.Duration
+	userRunsCC        bool
+	peerTLS           bool
 }
 
 // DuplicateChaincodeHandlerError returned if attempt to register same chaincodeID while a stream already exists.
@@ -345,7 +367,15 @@ func (chaincodeSupport *ChaincodeSupport) getArgsAndEnv(cccid *ccprovider.CCCont
 	}
 
 	if chaincodeSupport.chaincodeLogLevel != "" {
-		envs = append(envs, "CORE_LOGGING_CHAINCODE="+chaincodeSupport.chaincodeLogLevel)
+		envs = append(envs, "CORE_CHAINCODE_LOGGING_LEVEL="+chaincodeSupport.chaincodeLogLevel)
+	}
+
+	if chaincodeSupport.shimLogLevel != "" {
+		envs = append(envs, "CORE_CHAINCODE_LOGGING_SHIM="+chaincodeSupport.shimLogLevel)
+	}
+
+	if chaincodeSupport.logFormat != "" {
+		envs = append(envs, "CORE_CHAINCODE_LOGGING_FORMAT="+chaincodeSupport.logFormat)
 	}
 	switch cLang {
 	case pb.ChaincodeSpec_GOLANG, pb.ChaincodeSpec_CAR:
@@ -467,7 +497,6 @@ func (chaincodeSupport *ChaincodeSupport) Launch(context context.Context, cccid 
 	//build the chaincode
 	var cID *pb.ChaincodeID
 	var cMsg *pb.ChaincodeInput
-	var cLang pb.ChaincodeSpec_Type
 
 	var cds *pb.ChaincodeDeploymentSpec
 	var ci *pb.ChaincodeInvocationSpec
@@ -479,7 +508,6 @@ func (chaincodeSupport *ChaincodeSupport) Launch(context context.Context, cccid 
 	if cds != nil {
 		cID = cds.ChaincodeSpec.ChaincodeId
 		cMsg = cds.ChaincodeSpec.Input
-		cLang = cds.ChaincodeSpec.Type
 	} else {
 		cID = ci.ChaincodeSpec.ChaincodeId
 		cMsg = ci.ChaincodeSpec.Input
@@ -521,9 +549,10 @@ func (chaincodeSupport *ChaincodeSupport) Launch(context context.Context, cccid 
 		var depPayload []byte
 
 		//hopefully we are restarting from existing image and the deployed transaction exists
-		depPayload, err = GetCDSFromLCCC(context, cccid.TxID, cccid.SignedProposal, cccid.Proposal, cccid.ChainID, cID.Name)
+		//this will also validate the ID from the LSCC
+		depPayload, err = GetCDSFromLSCC(context, cccid.TxID, cccid.SignedProposal, cccid.Proposal, cccid.ChainID, cID.Name)
 		if err != nil {
-			return cID, cMsg, fmt.Errorf("Could not get deployment transaction from LCCC for %s - %s", canName, err)
+			return cID, cMsg, fmt.Errorf("Could not get deployment transaction from LSCC for %s - %s", canName, err)
 		}
 		if depPayload == nil {
 			return cID, cMsg, fmt.Errorf("failed to get deployment payload %s - %s", canName, err)
@@ -536,30 +565,37 @@ func (chaincodeSupport *ChaincodeSupport) Launch(context context.Context, cccid 
 		if err != nil {
 			return cID, cMsg, fmt.Errorf("failed to unmarshal deployment transactions for %s - %s", canName, err)
 		}
-
-		cLang = cds.ChaincodeSpec.Type
 	}
 
 	//from here on : if we launch the container and get an error, we need to stop the container
 
 	//launch container if it is a System container or not in dev mode
 	if (!chaincodeSupport.userRunsCC || cds.ExecEnv == pb.ChaincodeDeploymentSpec_SYSTEM) && (chrte == nil || chrte.handler == nil) {
-		//whether we deploying, upgrading or launching a chaincode we now have a
-		//deployment package. If lauching, we got it from LCCC and has gone through
-		//ccprovider.GetChaincodeFromFS
+		//NOTE-We need to streamline code a bit so the data from LSCC gets passed to this thus
+		//avoiding the need to go to the FS. In particular, we should use cdsfs completely. It is
+		//just a vestige of old protocol that we continue to use ChaincodeDeploymentSpec for
+		//anything other than Install. In particular, instantiate, invoke, upgrade should be using
+		//just some form of ChaincodeInvocationSpec.
+		//
+		//But for now, if we are invoking we have gone through the LSCC path above. If  instantiating
+		//or upgrading currently we send a CDS with nil CodePackage. In this case the codepath
+		//in the endorser has gone through LSCC validation. Just get the code from the FS.
 		if cds.CodePackage == nil {
 			//no code bytes for these situations
 			if !(chaincodeSupport.userRunsCC || cds.ExecEnv == pb.ChaincodeDeploymentSpec_SYSTEM) {
-				_, cdsfs, err := ccprovider.GetChaincodeFromFS(cID.Name, cID.Version)
+				ccpack, err := ccprovider.GetChaincodeFromFS(cID.Name, cID.Version)
 				if err != nil {
 					return cID, cMsg, err
 				}
-				cds.CodePackage = cdsfs.CodePackage
+
+				cds = ccpack.GetDepSpec()
 				chaincodeLogger.Debugf("launchAndWaitForRegister fetched %d from file system", len(cds.CodePackage), err)
 			}
 		}
 
 		builder := func() (io.Reader, error) { return platforms.GenerateDockerBuild(cds) }
+
+		cLang := cds.ChaincodeSpec.Type
 		err = chaincodeSupport.launchAndWaitForRegister(context, cccid, cds, cLang, builder)
 		if err != nil {
 			chaincodeLogger.Errorf("launchAndWaitForRegister failed %s", err)

@@ -23,7 +23,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	mockconfigtx "github.com/hyperledger/fabric/common/mocks/configtx"
 	"github.com/hyperledger/fabric/orderer/common/filter"
-	ordererledger "github.com/hyperledger/fabric/orderer/ledger"
+	"github.com/hyperledger/fabric/orderer/ledger"
 	cb "github.com/hyperledger/fabric/protos/common"
 	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
@@ -42,7 +42,7 @@ func (mlw *mockLedgerReadWriter) Append(block *cb.Block) error {
 	return nil
 }
 
-func (mlw *mockLedgerReadWriter) Iterator(startType *ab.SeekPosition) (ordererledger.Iterator, uint64) {
+func (mlw *mockLedgerReadWriter) Iterator(startType *ab.SeekPosition) (ledger.Iterator, uint64) {
 	panic("Unimplemented")
 }
 
@@ -131,7 +131,6 @@ func TestWriteLastConfig(t *testing.T) {
 
 	cm.SequenceVal = 1
 	expected = uint64(2)
-
 	if lc := utils.GetLastConfigIndexFromBlockOrPanic(cs.WriteBlock(cb.NewBlock(2, nil), nil, nil)); lc != expected {
 		t.Fatalf("Second block should have config block index of %d, but got %d", expected, lc)
 	}
@@ -139,5 +138,22 @@ func TestWriteLastConfig(t *testing.T) {
 	if lc := utils.GetLastConfigIndexFromBlockOrPanic(cs.WriteBlock(cb.NewBlock(3, nil), nil, nil)); lc != expected {
 		t.Fatalf("Second block should have config block index of %d, but got %d", expected, lc)
 	}
+
+	t.Run("ResetChainSupport", func(t *testing.T) {
+
+		cm.SequenceVal = 2
+		expected = uint64(4)
+
+		cs = &chainSupport{ledgerResources: &ledgerResources{configResources: &configResources{Manager: cm}, ledger: ml}, signer: mockCrypto()}
+
+		if lc := utils.GetLastConfigIndexFromBlockOrPanic(cs.WriteBlock(cb.NewBlock(4, nil), nil, nil)); lc != expected {
+			t.Fatalf("Second block should have config block index of %d, but got %d", expected, lc)
+		}
+
+		if lc := utils.GetLastConfigIndexFromBlockOrPanic(cs.WriteBlock(cb.NewBlock(5, nil), nil, nil)); lc != expected {
+			t.Fatalf("Second block should have config block index of %d, but got %d", expected, lc)
+		}
+
+	})
 
 }

@@ -19,17 +19,19 @@ package chaincode
 import (
 	"fmt"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/peer/common"
-	"github.com/op/go-logging"
 	"github.com/spf13/cobra"
 )
 
 const (
 	chainFuncName = "chaincode"
+	shortDes      = "Operate a chaincode: install|instantiate|invoke|package|query|signpackage|upgrade."
+	longDes       = "Operate a chaincode: install|instantiate|invoke|package|query|signpackage|upgrade."
 )
 
-var logger = logging.MustGetLogger("chaincodeCmd")
+var logger = flogging.MustGetLogger("chaincodeCmd")
 
 func AddFlags(cmd *cobra.Command) {
 	flags := cmd.PersistentFlags()
@@ -56,6 +58,9 @@ func AddFlags(cmd *cobra.Command) {
 		fmt.Sprint("The name of the endorsement system chaincode to be used for this chaincode"))
 	flags.StringVarP(&vscc, "vscc", "V", common.UndefinedParamValue,
 		fmt.Sprint("The name of the verification system chaincode to be used for this chaincode"))
+	flags.StringVarP(&orderingEndpoint, "orderer", "o", "", "Ordering service endpoint")
+	flags.BoolVarP(&tls, "tls", "", false, "Use TLS when communicating with the orderer endpoint")
+	flags.StringVarP(&caFile, "cafile", "", "", "Path to file containing PEM-encoded trusted certificate(s) for the ordering endpoint")
 }
 
 // Cmd returns the cobra command for Chaincode
@@ -66,8 +71,9 @@ func Cmd(cf *ChaincodeCmdFactory) *cobra.Command {
 	chaincodeCmd.AddCommand(invokeCmd(cf))
 	chaincodeCmd.AddCommand(queryCmd(cf))
 	chaincodeCmd.AddCommand(upgradeCmd(cf))
-	chaincodeCmd.AddCommand(packageCmd(cf))
+	chaincodeCmd.AddCommand(packageCmd(cf, nil))
 	chaincodeCmd.AddCommand(installCmd(cf))
+	chaincodeCmd.AddCommand(signpackageCmd(cf))
 
 	return chaincodeCmd
 }
@@ -88,10 +94,13 @@ var (
 	escc              string
 	vscc              string
 	policyMarhsalled  []byte
+	orderingEndpoint  string
+	tls               bool
+	caFile            string
 )
 
 var chaincodeCmd = &cobra.Command{
 	Use:   chainFuncName,
-	Short: fmt.Sprintf("%s specific commands.", chainFuncName),
-	Long:  fmt.Sprintf("%s specific commands.", chainFuncName),
+	Short: fmt.Sprint(shortDes),
+	Long:  fmt.Sprint(longDes),
 }

@@ -23,7 +23,7 @@ service Gossip {
 message Envelope {
     bytes payload   = 1;
     bytes signature = 2;
-    SecretEnvelope secretEnvelope = 3;
+    SecretEnvelope secret_envelope = 3;
 }
 
 // SecretEnvelope is a marshalled Secret
@@ -73,18 +73,18 @@ message GossipMessage {
 
     oneof content {
         // Membership
-        AliveMessage aliveMsg = 5;
-        MembershipRequest memReq = 6;
-        MembershipResponse memRes = 7;
+        AliveMessage alive_msg = 5;
+        MembershipRequest mem_req = 6;
+        MembershipResponse mem_res = 7;
 
         // Contains a ledger block
-        DataMessage dataMsg = 8;
+        DataMessage data_msg = 8;
 
         // Used for push&pull
         GossipHello hello = 9;
-        DataDigest  dataDig = 10;
-        DataRequest dataReq = 11;
-        DataUpdate  dataUpdate = 12;
+        DataDigest  data_dig = 10;
+        DataRequest data_req = 11;
+        DataUpdate  data_update = 12;
 
         // Empty message, used for pinging
         Empty empty = 13;
@@ -94,25 +94,25 @@ message GossipMessage {
 
         // Used for relaying information
         // about state
-        StateInfo stateInfo = 15;
+        StateInfo state_info = 15;
 
         // Used for sending sets of StateInfo messages
-        StateInfoSnapshot stateSnapshot = 16;
+        StateInfoSnapshot state_snapshot = 16;
 
         // Used for asking for StateInfoSnapshots
-        StateInfoPullRequest stateInfoPullReq = 17;
+        StateInfoPullRequest state_info_pull_req = 17;
 
         //  Used to ask from a remote peer a set of blocks
-        RemoteStateRequest stateRequest = 18;
+        RemoteStateRequest state_request = 18;
 
         // Used to send a set of blocks to a remote peer
-        RemoteStateResponse stateResponse = 19;
+        RemoteStateResponse state_response = 19;
 
         // Used to indicate intent of peer to become leader
-        LeadershipMessage leadershipMsg = 20;
+        LeadershipMessage leadership_msg = 20;
 
         // Used to learn of a peer's certificate
-        PeerIdentity peerIdentity = 21;
+        PeerIdentity peer_identity = 21;
     }
 }
 
@@ -121,7 +121,15 @@ message GossipMessage {
 message StateInfo {
     bytes metadata     = 1;
     PeerTime timestamp = 2;
-    bytes pkiID        = 3;
+    bytes pki_id       = 3;
+
+    // channel_MAC is an authentication code that proves
+    // that the peer that sent this message knows
+    // the name of the channel.
+    // The channel name that this message relates to
+    // can only be computed by a peer that has joined
+    // the channel
+    bytes channel_MAC  = 4;
 }
 
 // StateInfoSnapshot is an aggregation of StateInfo messages
@@ -132,14 +140,20 @@ message StateInfoSnapshot {
 // StateInfoPullRequest is used to fetch a StateInfoSnapshot
 // from a remote peer
 message StateInfoPullRequest {
-
+    // channel_MAC is an authentication code that proves
+    // that the peer that sent this message knows
+    // the name of the channel.
+    // The channel name that this message relates to
+    // can only be computed by a peer that has joined
+    // the channel
+    bytes channel_MAC  = 1;
 }
 
 // ConnEstablish is the message used for the gossip handshake
 // Whenever a peer connects to another peer, it handshakes
 // with it by sending this message that proves its identity
 message ConnEstablish {
-    bytes pkiID = 1;
+    bytes pki_id = 1;
     bytes cert  = 2;
     bytes hash  = 3;
 }
@@ -148,7 +162,7 @@ message ConnEstablish {
 // Used to make other peers learn of the identity
 // of a certain peer
 message PeerIdentity {
-    bytes pkiID    = 1;
+    bytes pki_id    = 1;
     bytes cert     = 2;
     bytes metadata = 3;
 }
@@ -156,9 +170,9 @@ message PeerIdentity {
 // Messages related to pull mechanism
 
 enum PullMsgType {
-    Undefined     = 0;
-    BlockMessage  = 1;
-    IdentityMsg   = 2;
+    UNDEFINED     = 0;
+    BLOCK_MSG     = 1;
+    IDENTITY_MSG  = 2;
 }
 
 // DataRequest is a message used for a peer to request
@@ -166,7 +180,7 @@ enum PullMsgType {
 message DataRequest {
     uint64 nonce             = 1;
     repeated string digests  = 2;
-    PullMsgType msgType      = 3;
+    PullMsgType msg_type     = 3;
 }
 
 // GossipHello is the message that is used for the peer to initiate
@@ -174,7 +188,7 @@ message DataRequest {
 message GossipHello {
     uint64 nonce        = 1;
     bytes metadata      = 2;
-    PullMsgType msgType = 3;
+    PullMsgType msg_type = 3;
 }
 
 // DataUpdate is the the final message in the pull phase
@@ -182,7 +196,7 @@ message GossipHello {
 message DataUpdate {
     uint64 nonce                = 1;
     repeated Envelope data      = 2;
-    PullMsgType msgType         = 3;
+    PullMsgType msg_type        = 3;
 }
 
 // DataDigest is the message sent from the receiver peer
@@ -190,7 +204,7 @@ message DataUpdate {
 message DataDigest {
     uint64 nonce             = 1;
     repeated string digests  = 2; // Maybe change this to bitmap later on
-    PullMsgType msgType      = 3;
+    PullMsgType msg_type     = 3;
 }
 
 
@@ -203,9 +217,8 @@ message DataMessage {
 
 // Payload contains a block
 message Payload {
-    uint64  seqNum  = 1;
-    string  hash    = 2;
-    bytes   data    = 3;
+    uint64  seq_num = 1;
+    bytes   data    = 2;
 }
 
 
@@ -222,21 +235,21 @@ message AliveMessage {
 // Leadership Message is sent during leader election to inform
 // remote peers about intent of peer to proclaim itself as leader
 message LeadershipMessage {
-    bytes pkiID        = 1;
+    bytes pki_id        = 1;
     PeerTime timestamp = 2;
-    bool isDeclaration = 3;
+    bool is_declaration = 3;
 }
 
 // PeerTime defines the logical time of a peer's life
 message PeerTime {
-    uint64 inc_number = 1;
-    uint64 seqNum     = 2;
+    uint64 inc_num = 1;
+    uint64 seq_num = 2;
 }
 
 // MembershipRequest is used to ask membership information
 // from a remote peer
 message MembershipRequest {
-    Envelope selfInformation     = 1;
+    Envelope self_information = 1;
     repeated bytes known         = 2;
 }
 
@@ -251,7 +264,7 @@ message MembershipResponse {
 message Member {
     string endpoint = 1;
     bytes  metadata = 2;
-    bytes  pkiID    = 3;
+    bytes  pki_id    = 3;
 }
 
 
@@ -264,7 +277,8 @@ message Empty {}
 // RemoteStateRequest is used to ask a set of blocks
 // from a remote peer
 message RemoteStateRequest {
-    repeated uint64 seqNums = 1;
+    uint64 start_seq_num = 1;
+    uint64 end_seq_num = 2;
 }
 
 // RemoteStateResponse is used to send a set of blocks

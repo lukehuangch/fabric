@@ -19,13 +19,15 @@ package configtx
 import (
 	"fmt"
 
-	"github.com/golang/protobuf/proto"
-	configtxorderer "github.com/hyperledger/fabric/common/configvalues/channel/orderer"
+	"github.com/hyperledger/fabric/common/config"
+	configmsp "github.com/hyperledger/fabric/common/config/msp"
+	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/msp"
 	cb "github.com/hyperledger/fabric/protos/common"
-	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
+
+	"github.com/golang/protobuf/proto"
 )
 
 const (
@@ -34,19 +36,9 @@ const (
 	CreationPolicyKey = "CreationPolicy"
 	msgVersion        = int32(0)
 	epoch             = 0
-
-	// ApplicationGroup identifies the `groups` map key in the channel
-	// config, under which the application-related config group is set.
-	ApplicationGroup = "Application"
-	// OrdererGroup identifies the `groups` map key in the channel
-	// config, under which the orderer-related config group is set.
-	OrdererGroup = "Orderer"
-	// MSPKey identifies the config key in the channel config,
-	// under which the application-related config group is set.
-	MSPKey = "MSP"
 )
 
-// Template can be used to faciliate creation of config transactions
+// Template can be used to facilitate creation of config transactions
 type Template interface {
 	// Envelope returns a ConfigUpdateEnvelope for the given chainID
 	Envelope(chainID string) (*cb.ConfigUpdateEnvelope, error)
@@ -70,11 +62,8 @@ func NewSimpleTemplate(configGroups ...*cb.ConfigGroup) Template {
 // Envelope returns a ConfigUpdateEnvelope for the given chainID
 func (st *simpleTemplate) Envelope(chainID string) (*cb.ConfigUpdateEnvelope, error) {
 	config, err := proto.Marshal(&cb.ConfigUpdate{
-		Header: &cb.ChannelHeader{
-			ChannelId: chainID,
-			Type:      int32(cb.HeaderType_CONFIG),
-		},
-		WriteSet: st.configGroup,
+		ChannelId: chainID,
+		WriteSet:  st.configGroup,
 	})
 
 	if err != nil {
@@ -146,11 +135,8 @@ func (ct *compositeTemplate) Envelope(chainID string) (*cb.ConfigUpdateEnvelope,
 	}
 
 	marshaledConfig, err := proto.Marshal(&cb.ConfigUpdate{
-		Header: &cb.ChannelHeader{
-			ChannelId: chainID,
-			Type:      int32(cb.HeaderType_CONFIG),
-		},
-		WriteSet: channel,
+		ChannelId: chainID,
+		WriteSet:  channel,
 	})
 	if err != nil {
 		return nil, err
@@ -159,29 +145,102 @@ func (ct *compositeTemplate) Envelope(chainID string) (*cb.ConfigUpdateEnvelope,
 	return &cb.ConfigUpdateEnvelope{ConfigUpdate: marshaledConfig}, nil
 }
 
-// NewChainCreationTemplate takes a CreationPolicy and a Template to produce a
-// Template which outputs an appropriately constructed list of ConfigUpdateEnvelopes.
-func NewChainCreationTemplate(creationPolicy string, template Template) Template {
-	result := cb.NewConfigGroup()
-	result.Groups[configtxorderer.GroupKey] = cb.NewConfigGroup()
-	result.Groups[configtxorderer.GroupKey].Values[CreationPolicyKey] = &cb.ConfigValue{
-		Value: utils.MarshalOrPanic(&ab.CreationPolicy{
-			Policy: creationPolicy,
-		}),
+type modPolicySettingTemplate struct {
+	modPolicy string
+	template  Template
+}
+
+// NewModPolicySettingTemplate wraps another template and sets the ModPolicy of
+// every ConfigGroup/ConfigValue/ConfigPolicy to modPolicy
+func NewModPolicySettingTemplate(modPolicy string, template Template) Template {
+	return &modPolicySettingTemplate{
+		modPolicy: modPolicy,
+		template:  template,
+	}
+}
+
+func setGroupModPolicies(modPolicy string, group *cb.ConfigGroup) {
+	group.ModPolicy = modPolicy
+
+	for _, value := range group.Values {
+		value.ModPolicy = modPolicy
 	}
 
-	return NewCompositeTemplate(NewSimpleTemplate(result), template)
+	for _, policy := range group.Policies {
+		policy.ModPolicy = modPolicy
+	}
+
+	for _, nextGroup := range group.Groups {
+		setGroupModPolicies(modPolicy, nextGroup)
+	}
+}
+
+func (mpst *modPolicySettingTemplate) Envelope(channelID string) (*cb.ConfigUpdateEnvelope, error) {
+	configUpdateEnv, err := mpst.template.Envelope(channelID)
+	if err != nil {
+		return nil, err
+	}
+
+	config, err := UnmarshalConfigUpdate(configUpdateEnv.ConfigUpdate)
+	if err != nil {
+		return nil, err
+	}
+
+	setGroupModPolicies(mpst.modPolicy, config.WriteSet)
+	configUpdateEnv.ConfigUpdate = utils.MarshalOrPanic(config)
+	return configUpdateEnv, nil
+}
+
+type channelCreationTemplate struct {
+	consortiumName string
+	orgs           []string
+}
+
+// NewChainCreationTemplate takes a consortium name and a Template to produce a
+// Template which outputs an appropriately constructed list of ConfigUpdateEnvelopes.
+func NewChainCreationTemplate(consortiumName string, orgs []string) Template {
+	return &channelCreationTemplate{
+		consortiumName: consortiumName,
+		orgs:           orgs,
+	}
+}
+
+func (cct *channelCreationTemplate) Envelope(channelID string) (*cb.ConfigUpdateEnvelope, error) {
+	rSet := config.TemplateConsortium(cct.consortiumName)
+	wSet := config.TemplateConsortium(cct.consortiumName)
+
+	rSet.Groups[config.ApplicationGroupKey] = cb.NewConfigGroup()
+	wSet.Groups[config.ApplicationGroupKey] = cb.NewConfigGroup()
+
+	for _, org := range cct.orgs {
+		rSet.Groups[config.ApplicationGroupKey].Groups[org] = cb.NewConfigGroup()
+		wSet.Groups[config.ApplicationGroupKey].Groups[org] = cb.NewConfigGroup()
+	}
+
+	wSet.Groups[config.ApplicationGroupKey].ModPolicy = configmsp.AdminsPolicyKey
+	wSet.Groups[config.ApplicationGroupKey].Policies[configmsp.AdminsPolicyKey] = policies.ImplicitMetaPolicyWithSubPolicy(configmsp.AdminsPolicyKey, cb.ImplicitMetaPolicy_MAJORITY)
+	wSet.Groups[config.ApplicationGroupKey].Policies[configmsp.WritersPolicyKey] = policies.ImplicitMetaPolicyWithSubPolicy(configmsp.WritersPolicyKey, cb.ImplicitMetaPolicy_ANY)
+	wSet.Groups[config.ApplicationGroupKey].Policies[configmsp.ReadersPolicyKey] = policies.ImplicitMetaPolicyWithSubPolicy(configmsp.ReadersPolicyKey, cb.ImplicitMetaPolicy_ANY)
+	wSet.Groups[config.ApplicationGroupKey].Version = 1
+
+	return &cb.ConfigUpdateEnvelope{
+		ConfigUpdate: utils.MarshalOrPanic(&cb.ConfigUpdate{
+			ChannelId: channelID,
+			ReadSet:   rSet,
+			WriteSet:  wSet,
+		}),
+	}, nil
 }
 
 // MakeChainCreationTransaction is a handy utility function for creating new chain transactions using the underlying Template framework
-func MakeChainCreationTransaction(creationPolicy string, chainID string, signer msp.SigningIdentity, templates ...Template) (*cb.Envelope, error) {
+func MakeChainCreationTransaction(channelID string, consortium string, signer msp.SigningIdentity, orgs ...string) (*cb.Envelope, error) {
 	sSigner, err := signer.Serialize()
 	if err != nil {
 		return nil, fmt.Errorf("Serialization of identity failed, err %s", err)
 	}
 
-	newChainTemplate := NewChainCreationTemplate(creationPolicy, NewCompositeTemplate(templates...))
-	newConfigUpdateEnv, err := newChainTemplate.Envelope(chainID)
+	newChainTemplate := NewChainCreationTemplate(consortium, orgs)
+	newConfigUpdateEnv, err := newChainTemplate.Envelope(channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +253,7 @@ func MakeChainCreationTransaction(creationPolicy string, chainID string, signer 
 		return nil, err
 	}
 
-	payloadChannelHeader := utils.MakeChannelHeader(cb.HeaderType_CONFIG_UPDATE, msgVersion, chainID, epoch)
+	payloadChannelHeader := utils.MakeChannelHeader(cb.HeaderType_CONFIG_UPDATE, msgVersion, channelID, epoch)
 	payloadSignatureHeader := utils.MakeSignatureHeader(sSigner, utils.CreateNonceOrPanic())
 	utils.SetTxID(payloadChannelHeader, payloadSignatureHeader)
 	payloadHeader := utils.MakePayloadHeader(payloadChannelHeader, payloadSignatureHeader)

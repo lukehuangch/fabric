@@ -42,7 +42,7 @@ type Manager struct {
 	BasePathVal string
 
 	// PolicyMap is returned is used to look up Policies in
-	PolicyMap map[string]*Policy
+	PolicyMap map[string]policies.Policy
 
 	// SubManagers is used for the return value of Manager
 	SubManagersMap map[string]*Manager
@@ -76,22 +76,4 @@ func (m *Manager) GetPolicy(id string) (policies.Policy, bool) {
 		}
 	}
 	return m.Policy, m.Policy != nil
-}
-
-type PolicyManagerMgmt struct{}
-
-func (m *PolicyManagerMgmt) GetPolicy(id string) (policies.Policy, bool) {
-	panic("implement me")
-}
-
-func (m *PolicyManagerMgmt) Manager(path []string) (policies.Manager, bool) {
-	return &Manager{Policy: &Policy{Err: nil}}, false
-}
-
-func (m *PolicyManagerMgmt) BasePath() string {
-	panic("implement me")
-}
-
-func (m *PolicyManagerMgmt) PolicyNames() []string {
-	panic("implement me")
 }

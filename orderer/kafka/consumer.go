@@ -47,7 +47,7 @@ func newConsumer(brokers []string, kafkaVersion sarama.KafkaVersion, tls config.
 		parent:    parent,
 		partition: partition,
 	}
-	logger.Debugf("Created new consumer for session (partition %s, beginning offset %d)", cp, offset)
+	logger.Debugf("[channel: %s] Created new consumer for session (beginning offset: %d)", cp.Topic(), offset)
 	return c, nil
 }
 
@@ -57,7 +57,7 @@ func (c *consumerImpl) Recv() <-chan *sarama.ConsumerMessage {
 	return c.partition.Messages()
 }
 
-// Errors returns a channel with errors occuring during
+// Errors returns a channel with errors occurring during
 // the consumption of a partition from the Kafka cluster.
 func (c *consumerImpl) Errors() <-chan *sarama.ConsumerError {
 	return c.partition.Errors()

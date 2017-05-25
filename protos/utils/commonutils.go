@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/hyperledger/fabric/core/crypto/primitives"
 	cb "github.com/hyperledger/fabric/protos/common"
+	pb "github.com/hyperledger/fabric/protos/peer"
 
 	"errors"
 
@@ -44,19 +44,19 @@ func Marshal(pb proto.Message) ([]byte, error) {
 	return proto.Marshal(pb)
 }
 
-// CreateNonceOrPanic generates a nonce using the crypto/primitives package
+// CreateNonceOrPanic generates a nonce using the common/crypto package
 // and panics if this operation fails.
 func CreateNonceOrPanic() []byte {
-	nonce, err := primitives.GetRandomNonce()
+	nonce, err := crypto.GetRandomNonce()
 	if err != nil {
 		panic(fmt.Errorf("Cannot generate random nonce: %s", err))
 	}
 	return nonce
 }
 
-// CreateNonce generates a nonce using the crypto/primitives package.
+// CreateNonce generates a nonce using the common/crypto package.
 func CreateNonce() ([]byte, error) {
-	nonce, err := primitives.GetRandomNonce()
+	nonce, err := crypto.GetRandomNonce()
 	if err != nil {
 		return nil, fmt.Errorf("Cannot generate random nonce: %s", err)
 	}
@@ -99,6 +99,34 @@ func UnmarshalEnvelope(encoded []byte) (*cb.Envelope, error) {
 		return nil, err
 	}
 	return envelope, err
+}
+
+// UnmarshalEnvelopeOfType unmarshals an envelope of the specified type, including
+// the unmarshaling the payload data
+func UnmarshalEnvelopeOfType(envelope *cb.Envelope, headerType cb.HeaderType, message proto.Message) (*cb.ChannelHeader, error) {
+	payload, err := UnmarshalPayload(envelope.Payload)
+	if err != nil {
+		return nil, err
+	}
+
+	if payload.Header == nil {
+		return nil, fmt.Errorf("Envelope must have a Header")
+	}
+
+	chdr, err := UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid ChannelHeader")
+	}
+
+	if chdr.Type != int32(headerType) {
+		return nil, fmt.Errorf("Not a tx of type %v", headerType)
+	}
+
+	if err = proto.Unmarshal(payload.Data, message); err != nil {
+		return nil, fmt.Errorf("Error unmarshaling message for type %v: %s", headerType, err)
+	}
+
+	return chdr, nil
 }
 
 // ExtractEnvelopeOrPanic retrieves the requested envelope from a given block and unmarshals it -- it panics if either of these operation fail.
@@ -219,4 +247,15 @@ func UnmarshalChannelHeader(bytes []byte) (*cb.ChannelHeader, error) {
 	}
 
 	return chdr, nil
+}
+
+// UnmarshalChaincodeID returns a ChaincodeID from bytes
+func UnmarshalChaincodeID(bytes []byte) (*pb.ChaincodeID, error) {
+	ccid := &pb.ChaincodeID{}
+	err := proto.Unmarshal(bytes, ccid)
+	if err != nil {
+		return nil, fmt.Errorf("UnmarshalChaincodeID failed, err %s", err)
+	}
+
+	return ccid, nil
 }

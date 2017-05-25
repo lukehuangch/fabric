@@ -19,7 +19,7 @@ package service
 import (
 	"reflect"
 
-	configvaluesapi "github.com/hyperledger/fabric/common/configvalues"
+	"github.com/hyperledger/fabric/common/config"
 
 	"github.com/hyperledger/fabric/protos/peer"
 )
@@ -30,7 +30,7 @@ type Config interface {
 	ChainID() string
 
 	// Organizations returns a map of org ID to ApplicationOrgConfig
-	Organizations() map[string]configvaluesapi.ApplicationOrg
+	Organizations() map[string]config.ApplicationOrg
 
 	// Sequence should return the sequence number of the current configuration
 	Sequence() uint64
@@ -44,7 +44,7 @@ type ConfigProcessor interface {
 
 type configStore struct {
 	anchorPeers []*peer.AnchorPeer
-	orgMap      map[string]configvaluesapi.ApplicationOrg
+	orgMap      map[string]config.ApplicationOrg
 }
 
 type configEventReceiver interface {
@@ -68,8 +68,8 @@ func newConfigEventer(receiver configEventReceiver) *configEventer {
 // Note, that a changing sequence number is ignored as changing configuration
 func (ce *configEventer) ProcessConfigUpdate(config Config) {
 	logger.Debugf("Processing new config for channel %s", config.ChainID())
-
-	if ce.lastConfig != nil && reflect.DeepEqual(ce.lastConfig.orgMap, config.Organizations()) {
+	orgMap := cloneOrgConfig(config.Organizations())
+	if ce.lastConfig != nil && reflect.DeepEqual(ce.lastConfig.orgMap, orgMap) {
 		logger.Debugf("Ignoring new config for channel %s because it contained no anchor peer updates", config.ChainID())
 		return
 	}
@@ -80,11 +80,41 @@ func (ce *configEventer) ProcessConfigUpdate(config Config) {
 	}
 
 	newConfig := &configStore{
-		orgMap:      config.Organizations(),
+		orgMap:      orgMap,
 		anchorPeers: newAnchorPeers,
 	}
 	ce.lastConfig = newConfig
 
 	logger.Debugf("Calling out because config was updated for channel %s", config.ChainID())
 	ce.receiver.configUpdated(config)
+}
+
+func cloneOrgConfig(src map[string]config.ApplicationOrg) map[string]config.ApplicationOrg {
+	clone := make(map[string]config.ApplicationOrg)
+	for k, v := range src {
+		clone[k] = &appGrp{
+			name:        v.Name(),
+			mspID:       v.MSPID(),
+			anchorPeers: v.AnchorPeers(),
+		}
+	}
+	return clone
+}
+
+type appGrp struct {
+	name        string
+	mspID       string
+	anchorPeers []*peer.AnchorPeer
+}
+
+func (ag *appGrp) Name() string {
+	return ag.name
+}
+
+func (ag *appGrp) MSPID() string {
+	return ag.mspID
+}
+
+func (ag *appGrp) AnchorPeers() []*peer.AnchorPeer {
+	return ag.anchorPeers
 }

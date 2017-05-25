@@ -25,19 +25,23 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
 	"github.com/hyperledger/fabric/core/ledger/util/couchdb"
-	logging "github.com/op/go-logging"
 )
 
-var logger = logging.MustGetLogger("statecouchdb")
+var logger = flogging.MustGetLogger("statecouchdb")
 
 var compositeKeySep = []byte{0x00}
 var lastKeyIndicator = byte(0x01)
 
 var binaryWrapper = "valueBytes"
+
+//querySkip is implemented for future use by query paging
+//currently defaulted to 0 and is not used
+var querySkip = 0
 
 // VersionedDBProvider implements interface VersionedDBProvider
 type VersionedDBProvider struct {
@@ -50,8 +54,9 @@ type VersionedDBProvider struct {
 // NewVersionedDBProvider instantiates VersionedDBProvider
 func NewVersionedDBProvider() (*VersionedDBProvider, error) {
 	logger.Debugf("constructing CouchDB VersionedDBProvider")
-	couchDBDef := ledgerconfig.GetCouchDBDefinition()
-	couchInstance, err := couchdb.CreateCouchInstance(couchDBDef.URL, couchDBDef.Username, couchDBDef.Password)
+	couchDBDef := couchdb.GetCouchDBDefinition()
+	couchInstance, err := couchdb.CreateCouchInstance(couchDBDef.URL, couchDBDef.Username, couchDBDef.Password,
+		couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -128,10 +133,10 @@ func (vdb *VersionedDB) GetState(namespace string, key string) (*statedb.Version
 	return &statedb.VersionedValue{Value: returnValue, Version: &returnVersion}, nil
 }
 
-func removeDataWrapper(wrappedValue []byte, attachments []couchdb.Attachment) ([]byte, version.Height) {
+func removeDataWrapper(wrappedValue []byte, attachments []*couchdb.Attachment) ([]byte, version.Height) {
 
 	//initialize the return value
-	returnValue := []byte{} // TODO: empty byte or nil
+	returnValue := []byte{}
 
 	//initialize a default return version
 	returnVersion := version.NewHeight(0, 0)
@@ -140,7 +145,9 @@ func removeDataWrapper(wrappedValue []byte, attachments []couchdb.Attachment) ([
 	jsonResult := make(map[string]interface{})
 
 	//unmarshal the selected json into the generic map
-	json.Unmarshal(wrappedValue, &jsonResult)
+	decoder := json.NewDecoder(bytes.NewBuffer(wrappedValue))
+	decoder.UseNumber()
+	_ = decoder.Decode(&jsonResult)
 
 	// handle binary or json data
 	if jsonResult[dataWrapper] == nil && attachments != nil { // binary attachment
@@ -195,12 +202,15 @@ func (vdb *VersionedDB) GetStateMultipleKeys(namespace string, keys []string) ([
 // endKey is exclusive
 func (vdb *VersionedDB) GetStateRangeScanIterator(namespace string, startKey string, endKey string) (statedb.ResultsIterator, error) {
 
+	//Get the querylimit from core.yaml
+	queryLimit := ledgerconfig.GetQueryLimit()
+
 	compositeStartKey := constructCompositeKey(namespace, startKey)
 	compositeEndKey := constructCompositeKey(namespace, endKey)
 	if endKey == "" {
 		compositeEndKey[len(compositeEndKey)-1] = lastKeyIndicator
 	}
-	queryResult, err := vdb.db.ReadDocRange(string(compositeStartKey), string(compositeEndKey), 1000, 0)
+	queryResult, err := vdb.db.ReadDocRange(string(compositeStartKey), string(compositeEndKey), queryLimit, querySkip)
 	if err != nil {
 		logger.Debugf("Error calling ReadDocRange(): %s\n", err.Error())
 		return nil, err
@@ -213,16 +223,16 @@ func (vdb *VersionedDB) GetStateRangeScanIterator(namespace string, startKey str
 // ExecuteQuery implements method in VersionedDB interface
 func (vdb *VersionedDB) ExecuteQuery(namespace, query string) (statedb.ResultsIterator, error) {
 
-	//TODO - limit is currently set at 1000,  eventually this will need to be changed
-	//to reflect a config option and potentially return an exception if the threshold is exceeded
-	// skip (paging) is not utilized by fabric
-	queryString, err := ApplyQueryWrapper(namespace, query)
+	//Get the querylimit from core.yaml
+	queryLimit := ledgerconfig.GetQueryLimit()
+
+	queryString, err := ApplyQueryWrapper(namespace, query, queryLimit, 0)
 	if err != nil {
-		logger.Debugf("Error calling QueryDocuments(): %s\n", err.Error())
+		logger.Debugf("Error calling ApplyQueryWrapper(): %s\n", err.Error())
 		return nil, err
 	}
 
-	queryResult, err := vdb.db.QueryDocuments(queryString, 1000, 0)
+	queryResult, err := vdb.db.QueryDocuments(queryString)
 	if err != nil {
 		logger.Debugf("Error calling QueryDocuments(): %s\n", err.Error())
 		return nil, err
@@ -255,12 +265,14 @@ func (vdb *VersionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 					// Handle it as json
 					couchDoc.JSONValue = addVersionAndChainCodeID(vv.Value, ns, vv.Version)
 				} else { // if the data is not JSON, save as binary attachment in Couch
-					//Create an attachment structure and load the bytes
+
 					attachment := &couchdb.Attachment{}
 					attachment.AttachmentBytes = vv.Value
 					attachment.ContentType = "application/octet-stream"
 					attachment.Name = binaryWrapper
-					couchDoc.Attachments = append(couchDoc.Attachments, *attachment)
+					attachments := append([]*couchdb.Attachment{}, attachment)
+
+					couchDoc.Attachments = attachments
 					couchDoc.JSONValue = addVersionAndChainCodeID(nil, ns, vv.Version)
 				}
 
@@ -326,8 +338,9 @@ type couchSavepointData struct {
 
 // recordSavepoint Record a savepoint in statedb.
 // Couch parallelizes writes in cluster or sharded setup and ordering is not guaranteed.
-// Hence we need to fence the savepoint with sync. So ensure_full_commit is called before AND after writing savepoint document
-// TODO: Optimization - merge 2nd ensure_full_commit with savepoint by using X-Couch-Full-Commit header
+// Hence we need to fence the savepoint with sync. So ensure_full_commit is called before
+// savepoint to ensure all block writes are flushed. Savepoint itself does not need to be flushed,
+// it will get flushed with next block if not yet committed.
 func (vdb *VersionedDB) recordSavepoint(height *version.Height) error {
 	var err error
 	var savepointDoc couchSavepointData
@@ -362,12 +375,6 @@ func (vdb *VersionedDB) recordSavepoint(height *version.Height) error {
 		return err
 	}
 
-	// ensure full commit to flush savepoint to disk
-	dbResponse, err = vdb.db.EnsureFullCommit()
-	if err != nil || dbResponse.Ok != true {
-		logger.Errorf("Failed to perform full commit\n")
-		return errors.New("Failed to perform full commit")
-	}
 	return nil
 }
 
@@ -466,11 +473,9 @@ func (scanner *queryScanner) Next() (statedb.QueryResult, error) {
 	//remove the data wrapper and return the value and version
 	returnValue, returnVersion := removeDataWrapper(selectedResultRecord.Value, selectedResultRecord.Attachments)
 
-	return &statedb.VersionedQueryRecord{
-		Namespace: namespace,
-		Key:       key,
-		Version:   &returnVersion,
-		Record:    returnValue}, nil
+	return &statedb.VersionedKV{
+		CompositeKey:   statedb.CompositeKey{Namespace: namespace, Key: key},
+		VersionedValue: statedb.VersionedValue{Value: returnValue, Version: &returnVersion}}, nil
 }
 
 func (scanner *queryScanner) Close() {

@@ -17,10 +17,28 @@ import os
 import uuid
 import bdd_test_util
 from contexthelper import ContextHelper
-import peer_basic_impl
 import json
 
 from abc import ABCMeta, abstractmethod
+
+class ContainerData:
+    def __init__(self, containerName, ipAddress, envFromInspect, composeService, ports):
+        self.containerName = containerName
+        self.ipAddress = ipAddress
+        self.envFromInspect = envFromInspect
+        self.composeService = composeService
+        self.ports = ports
+
+    def getEnv(self, key):
+        envValue = None
+        for val in self.envFromInspect:
+            if val.startswith(key):
+                envValue = val[len(key):]
+                break
+        if envValue == None:
+            raise Exception("ENV key not found ({0}) for container ({1})".format(key, self.containerName))
+        return envValue
+
 
 class CompositionCallback:
     __metaclass__ = ABCMeta
@@ -64,8 +82,8 @@ class Composition:
     def GetUUID(cls):
         return GetDockerSafeUUID()
 
-    def __init__(self, context, composeFilesYaml, projectName = None,
-                 force_recreate = True, components = []):
+    def __init__(self, context, composeFilesYaml, projectName=None,
+                 force_recreate=True, components=[], register_and_up=True):
         self.contextHelper = ContextHelper.GetHelper(context=context)
         if not projectName:
             projectName = self.contextHelper.getGuuid()
@@ -73,11 +91,13 @@ class Composition:
         self.context = context
         self.containerDataList = []
         self.composeFilesYaml = composeFilesYaml
-
         self.serviceNames = []
         self.serviceNames = self._collectServiceNames()
-        [callback.composing(self, context) for callback in Composition.GetCompositionCallbacksFromContext(context)]
-        self.up(context, force_recreate, components)
+        if register_and_up:
+            # Register with contextHelper (Supports docgen)
+            self.contextHelper.registerComposition(self)
+            [callback.composing(self, context) for callback in Composition.GetCompositionCallbacksFromContext(context)]
+            self.up(context, force_recreate, components)
 
     def _collectServiceNames(self):
         'First collect the services names.'
@@ -199,7 +219,7 @@ class Composition:
             # container docker-compose service
             container_compose_service = container['Config']['Labels']['com.docker.compose.service']
 
-            self.containerDataList.append(peer_basic_impl.ContainerData(container_name, container_ipaddress, container_env, container_compose_service, container_ports))
+            self.containerDataList.append(ContainerData(container_name, container_ipaddress, container_env, container_compose_service, container_ports))
 
     def decompose(self):
         self.issueCommand(["unpause"])

@@ -31,6 +31,7 @@ import (
 	genesisconfig "github.com/hyperledger/fabric/common/configtx/tool/localconfig"
 	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
 	"github.com/hyperledger/fabric/common/localmsp"
+	cf "github.com/hyperledger/fabric/core/config"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
 	"github.com/hyperledger/fabric/orderer/ledger"
 	"github.com/hyperledger/fabric/orderer/ledger/ram"
@@ -87,6 +88,11 @@ func TestSbftPeer(t *testing.T) {
 	skipInShortMode(t)
 	logging.SetLevel(logging.DEBUG, "")
 
+	mspDir, err := cf.GetDevMspDir()
+	if err != nil {
+		panic("could not get DevMspDir")
+	}
+
 	// Start SBFT
 	dataTmpDir, err := ioutil.TempDir("", "sbft_test")
 	if err != nil {
@@ -106,7 +112,7 @@ func TestSbftPeer(t *testing.T) {
 	keyFile := "sbft/testdata/key.pem"
 	cons := &simplebft.Config{N: 1, F: 0, BatchDurationNsec: 1000, BatchSizeBytes: 1000000000, RequestTimeoutNsec: 1000000000}
 	c := &sbft.ConsensusConfig{Consensus: cons, Peers: peers}
-	sc := &backend.StackConfig{listenAddr, certFile, keyFile, dataTmpDir}
+	sc := &backend.StackConfig{ListenAddr: listenAddr, CertFile: certFile, KeyFile: keyFile, DataDir: dataTmpDir}
 	sbftConsenter := sbft.New(c, sc)
 	<-time.After(5 * time.Second)
 	// End SBFT
@@ -114,7 +120,7 @@ func TestSbftPeer(t *testing.T) {
 	// Start GRPC
 	logger.Info("Creating a GRPC server.")
 	conf := config.Load()
-	conf.General.LocalMSPDir = pwd + "/../msp/sampleconfig"
+	conf.General.LocalMSPDir = mspDir
 	conf.General.LocalMSPID = "DEFAULT"
 	lf := newRAMLedgerFactory()
 	consenters := make(map[string]multichain.Consenter)
@@ -278,7 +284,7 @@ func broadcastSender(t *testing.T, resultch chan item, errorch chan error, clien
 	resultch <- item{itemtype: sent, payload: mpl}
 }
 
-func newRAMLedgerFactory() ordererledger.Factory {
+func newRAMLedgerFactory() ledger.Factory {
 	rlf := ramledger.New(10)
 	rl, err := rlf.GetOrCreate(provisional.TestChainID)
 	if err != nil {
