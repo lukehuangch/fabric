@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package state
@@ -19,6 +9,7 @@ package state
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +46,8 @@ const (
 
 	defChannelBufferSize     = 100
 	defAntiEntropyMaxRetries = 3
+
+	defMaxBlockDistance = 100
 )
 
 // GossipAdapter defines gossip/communication required interface for state provider
@@ -404,10 +397,11 @@ func (s *GossipStateProviderImpl) queueNewMessage(msg *proto.GossipMessage) {
 
 	dataMsg := msg.GetDataMsg()
 	if dataMsg != nil {
-		// Add new payload to ordered set
-
+		if err := s.AddPayload(dataMsg.GetPayload()); err != nil {
+			logger.Warning("Failed adding payload:", err)
+			return
+		}
 		logger.Debugf("Received new payload with sequence number = [%d]", dataMsg.Payload.SeqNum)
-		s.payloads.Push(dataMsg.GetPayload())
 	} else {
 		logger.Debug("Gossip message received is not of data message type, usually this should not happen.")
 	}
@@ -460,9 +454,13 @@ func (s *GossipStateProviderImpl) antiEntropy() {
 				logger.Error("Cannot obtain ledger height, due to", err)
 				continue
 			}
+			if current == 0 {
+				logger.Error("Ledger reported block height of 0 but this should be impossible")
+				continue
+			}
 			max := s.maxAvailableLedgerHeight()
 
-			if current == max {
+			if current-1 >= max {
 				continue
 			}
 
@@ -612,8 +610,19 @@ func (s *GossipStateProviderImpl) GetBlock(index uint64) *common.Block {
 
 // AddPayload add new payload into state
 func (s *GossipStateProviderImpl) AddPayload(payload *proto.Payload) error {
-
+	if payload == nil {
+		return errors.New("Given payload is nil")
+	}
 	logger.Debug("Adding new payload into the buffer, seqNum = ", payload.SeqNum)
+	height, err := s.committer.LedgerHeight()
+	if err != nil {
+		return fmt.Errorf("Failed obtaining ledger height: %v", err)
+	}
+
+	if payload.SeqNum-height >= defMaxBlockDistance {
+		return fmt.Errorf("Ledger height is at %d, cannot enqueue block with sequence of %d", height, payload.SeqNum)
+	}
+
 	return s.payloads.Push(payload)
 }
 

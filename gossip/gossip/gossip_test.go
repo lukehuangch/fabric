@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package gossip
@@ -218,10 +208,10 @@ func newGossipInstanceWithCustomMCS(portPrefix int, id int, maxMsgCount int, mcs
 		PublishStateInfoInterval:   time.Duration(1) * time.Second,
 		RequestStateInfoInterval:   time.Duration(1) * time.Second,
 	}
-
-	idMapper := identity.NewIdentityMapper(mcs)
+	selfId := api.PeerIdentityType(conf.InternalEndpoint)
+	idMapper := identity.NewIdentityMapper(mcs, selfId)
 	g := NewGossipServiceWithServer(conf, &orgCryptoService{}, mcs, idMapper,
-		api.PeerIdentityType(conf.InternalEndpoint), nil)
+		selfId, nil)
 
 	return g
 }
@@ -251,10 +241,11 @@ func newGossipInstanceWithOnlyPull(portPrefix int, id int, maxMsgCount int, boot
 	}
 
 	cryptoService := &naiveCryptoService{}
-	idMapper := identity.NewIdentityMapper(cryptoService)
+	selfId := api.PeerIdentityType(conf.InternalEndpoint)
+	idMapper := identity.NewIdentityMapper(cryptoService, selfId)
 
 	g := NewGossipServiceWithServer(conf, &orgCryptoService{}, cryptoService, idMapper,
-		api.PeerIdentityType(conf.InternalEndpoint), nil)
+		selfId, nil)
 	return g
 }
 
@@ -760,7 +751,7 @@ func TestMembershipRequestSpoofing(t *testing.T) {
 
 	// Now, create a membership request message
 	memRequestSpoofFactory := func(aliveMsgEnv *proto.Envelope) *proto.SignedGossipMessage {
-		return (&proto.GossipMessage{
+		sMsg, _ := (&proto.GossipMessage{
 			Tag:   proto.GossipMessage_EMPTY,
 			Nonce: uint64(0),
 			Content: &proto.GossipMessage_MemReq{
@@ -770,6 +761,7 @@ func TestMembershipRequestSpoofing(t *testing.T) {
 				},
 			},
 		}).NoopSign()
+		return sMsg
 	}
 	spoofedMemReq := memRequestSpoofFactory(aliveMsg.GetSourceEnvelope())
 	g2.Send(spoofedMemReq.GossipMessage, &comm.RemotePeer{Endpoint: "localhost:2000", PKIID: common.PKIidType("localhost:2000")})
@@ -1088,6 +1080,10 @@ var connectionLeak = func(g goroutine) bool {
 	return searchInStackTrace("comm.(*connection).writeToStream", g.stack)
 }
 
+var connectionLeak2 = func(g goroutine) bool {
+	return searchInStackTrace("comm.(*connection).readFromStream", g.stack)
+}
+
 var runTests = func(g goroutine) bool {
 	return searchInStackTrace("testing.RunTests", g.stack)
 }
@@ -1109,6 +1105,9 @@ var clientConn = func(g goroutine) bool {
 }
 
 var testingg = func(g goroutine) bool {
+	if len(g.stack) == 0 {
+		return false
+	}
 	return strings.Index(g.stack[len(g.stack)-1], "testing.go") != -1
 }
 
@@ -1124,7 +1123,8 @@ func anyOfPredicates(predicates ...goroutinePredicate) goroutinePredicate {
 }
 
 func shouldNotBeRunningAtEnd(gr goroutine) bool {
-	return !anyOfPredicates(runTests, goExit, testingg, waitForTestCompl, gossipTest, clientConn, connectionLeak)(gr)
+	return !anyOfPredicates(runTests, goExit, testingg, waitForTestCompl, gossipTest,
+		clientConn, connectionLeak, connectionLeak2)(gr)
 }
 
 func ensureGoroutineExit(t *testing.T) {
