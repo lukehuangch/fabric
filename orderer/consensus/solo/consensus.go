@@ -17,9 +17,11 @@ limitations under the License.
 package solo
 
 import (
+	"fmt"
 	"time"
 
-	"github.com/hyperledger/fabric/orderer/common/multichannel"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
+	"github.com/hyperledger/fabric/orderer/consensus"
 	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/op/go-logging"
 )
@@ -29,24 +31,24 @@ var logger = logging.MustGetLogger("orderer/solo")
 type consenter struct{}
 
 type chain struct {
-	support  multichannel.ConsenterSupport
+	support  consensus.ConsenterSupport
 	sendChan chan *cb.Envelope
 	exitChan chan struct{}
 }
 
 // New creates a new consenter for the solo consensus scheme.
 // The solo consensus scheme is very simple, and allows only one consenter for a given chain (this process).
-// It accepts messages being delivered via Enqueue, orders them, and then uses the blockcutter to form the messages
+// It accepts messages being delivered via Order/Configure, orders them, and then uses the blockcutter to form the messages
 // into blocks before writing to the given ledger
-func New() multichannel.Consenter {
+func New() consensus.Consenter {
 	return &consenter{}
 }
 
-func (solo *consenter) HandleChain(support multichannel.ConsenterSupport, metadata *cb.Metadata) (multichannel.Chain, error) {
+func (solo *consenter) HandleChain(support consensus.ConsenterSupport, metadata *cb.Metadata) (consensus.Chain, error) {
 	return newChain(support), nil
 }
 
-func newChain(support multichannel.ConsenterSupport) *chain {
+func newChain(support consensus.ConsenterSupport) *chain {
 	return &chain{
 		support:  support,
 		sendChan: make(chan *cb.Envelope),
@@ -67,14 +69,20 @@ func (ch *chain) Halt() {
 	}
 }
 
-// Enqueue accepts a message and returns true on acceptance, or false on shutdown
-func (ch *chain) Enqueue(env *cb.Envelope) bool {
+// Order accepts normal messages for ordering
+func (ch *chain) Order(env *cb.Envelope, configSeq uint64) error {
 	select {
 	case ch.sendChan <- env:
-		return true
+		return nil
 	case <-ch.exitChan:
-		return false
+		return fmt.Errorf("Exiting")
 	}
+}
+
+// Order accepts normal messages for ordering
+func (ch *chain) Configure(configUpdate *cb.Envelope, config *cb.Envelope, configSeq uint64) error {
+	// TODO, handle this specially
+	return ch.Order(config, configSeq)
 }
 
 // Errored only closes on exit
@@ -93,22 +101,29 @@ func (ch *chain) main() {
 				logger.Panicf("If a message has arrived to this point, it should already have been classified once")
 			}
 			switch class {
-			case multichannel.ConfigUpdateMsg:
+			case msgprocessor.ConfigUpdateMsg:
+				_, err := ch.support.ProcessNormalMsg(msg)
+				if err != nil {
+					logger.Warningf("Discarding bad config message: %s", err)
+					continue
+				}
+
 				batch := ch.support.BlockCutter().Cut()
 				if batch != nil {
 					block := ch.support.CreateNextBlock(batch)
 					ch.support.WriteBlock(block, nil)
 				}
 
-				_, err := ch.support.ProcessNormalMsg(msg)
-				if err != nil {
-					logger.Warningf("Discarding bad config message: %s", err)
-					continue
-				}
 				block := ch.support.CreateNextBlock([]*cb.Envelope{msg})
 				ch.support.WriteConfigBlock(block, nil)
 				timer = nil
-			case multichannel.NormalMsg:
+			case msgprocessor.NormalMsg:
+				_, err := ch.support.ProcessNormalMsg(msg)
+				if err != nil {
+					logger.Warningf("Discarding bad normal message: %s", err)
+					continue
+				}
+
 				batches, ok := ch.support.BlockCutter().Ordered(msg)
 				if ok && len(batches) == 0 && timer == nil {
 					timer = time.After(ch.support.SharedConfig().BatchTimeout())
