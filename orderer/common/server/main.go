@@ -15,10 +15,10 @@ import (
 	_ "net/http/pprof" // This is essentially the main package for the orderer
 	"os"
 
-	genesisconfig "github.com/hyperledger/fabric/common/configtx/tool/localconfig"
-	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
 	"github.com/hyperledger/fabric/common/crypto"
 	"github.com/hyperledger/fabric/common/flogging"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/provisional"
 	"github.com/hyperledger/fabric/core/comm"
 	"github.com/hyperledger/fabric/orderer/common/bootstrap/file"
 	"github.com/hyperledger/fabric/orderer/common/ledger"
@@ -72,7 +72,7 @@ func Main() {
 func Start(cmd string, conf *config.TopLevel) {
 	signer := localmsp.NewSigner()
 	manager := initializeMultichannelRegistrar(conf, signer)
-	server := NewServer(manager, signer)
+	server := NewServer(manager, signer, &conf.Debug)
 
 	switch cmd {
 	case start.FullCommand(): // "start" command
@@ -92,6 +92,7 @@ func Start(cmd string, conf *config.TopLevel) {
 
 // Set the logging level
 func initializeLoggingLevel(conf *config.TopLevel) {
+	flogging.InitBackend(flogging.SetFormat(conf.General.LogFormat), os.Stderr)
 	flogging.InitFromSpec(conf.General.LogLevel)
 	if conf.Kafka.Verbose {
 		sarama.Logger = log.New(os.Stdout, "[sarama] ", log.Ldate|log.Lmicroseconds|log.Lshortfile)

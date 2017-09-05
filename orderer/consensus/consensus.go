@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package consensus
 
 import (
-	"github.com/hyperledger/fabric/common/config"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/crypto"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
@@ -32,10 +32,12 @@ type Consenter interface {
 // 1. Messages are ordered into a stream, the stream is cut into blocks, the blocks are committed (solo, kafka)
 // 2. Messages are cut into blocks, the blocks are ordered, then the blocks are committed (sbft)
 type Chain interface {
-	// NOTE: The solo/kafka consenters have not been updated to perform the revalidation
+	// NOTE: The kafka consenter has not been updated to perform the revalidation
 	// checks conditionally.  For now, Order/Configure are essentially Enqueue as before.
 	// This does not cause data inconsistency, but it wastes cycles and will be required
 	// to properly support the ConfigUpdate concept once introduced
+	// Once this is done, the MsgClassification logic in msgprocessor should return error
+	// for non ConfigUpdate/Normal msg types
 
 	// Order accepts a message which has been processed at a given configSeq.
 	// If the configSeq advances, it is the responsibility of the consenter
@@ -77,17 +79,20 @@ type ConsenterSupport interface {
 	BlockCutter() blockcutter.Receiver
 
 	// SharedConfig provides the shared config from the channel's current config block.
-	SharedConfig() config.Orderer
+	SharedConfig() channelconfig.Orderer
 
 	// CreateNextBlock takes a list of messages and creates the next block based on the block with highest block number committed to the ledger
 	// Note that either WriteBlock or WriteConfigBlock must be called before invoking this method a second time.
 	CreateNextBlock(messages []*cb.Envelope) *cb.Block
 
 	// WriteBlock commits a block to the ledger.
-	WriteBlock(block *cb.Block, encodedMetadataValue []byte) *cb.Block
+	WriteBlock(block *cb.Block, encodedMetadataValue []byte)
 
-	// WriteBlock commits a block to the ledger, and applies the config update inside.
-	WriteConfigBlock(block *cb.Block, encodedMetadataValue []byte) *cb.Block
+	// WriteConfigBlock commits a block to the ledger, and applies the config update inside.
+	WriteConfigBlock(block *cb.Block, encodedMetadataValue []byte)
+
+	// Sequence returns the current config squence.
+	Sequence() uint64
 
 	// ChainID returns the channel ID this support is associated with.
 	ChainID() string

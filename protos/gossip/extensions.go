@@ -18,6 +18,7 @@ package gossip
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -344,12 +345,6 @@ func (c *ConnectionInfo) String() string {
 	return fmt.Sprintf("%s %v", c.Endpoint, c.ID)
 }
 
-// IsAuthenticated returns whether the connection to the remote peer
-// was authenticated when the handshake took place
-func (c *ConnectionInfo) IsAuthenticated() bool {
-	return c.Auth != nil
-}
-
 // AuthInfo represents the authentication
 // data that was provided by the remote peer
 // at the connection time
@@ -540,6 +535,28 @@ func (m *SignedGossipMessage) String() string {
 		}
 	}
 	return fmt.Sprintf("GossipMessage: %v, Envelope: %s", gMsg, env)
+}
+
+func (dd *DataRequest) FormattedDigests() []string {
+	if dd.MsgType == PullMsgType_IDENTITY_MSG {
+		return digestsToHex(dd.Digests)
+	}
+	return dd.Digests
+}
+
+func (dd *DataDigest) FormattedDigests() []string {
+	if dd.MsgType == PullMsgType_IDENTITY_MSG {
+		return digestsToHex(dd.Digests)
+	}
+	return dd.Digests
+}
+
+func digestsToHex(digests []string) []string {
+	a := make([]string, len(digests))
+	for i, dig := range digests {
+		a[i] = hex.EncodeToString([]byte(dig))
+	}
+	return a
 }
 
 // Abs returns abs(a-b)

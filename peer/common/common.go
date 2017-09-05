@@ -21,8 +21,7 @@ import (
 	"os"
 
 	"github.com/hyperledger/fabric/bccsp/factory"
-	"github.com/hyperledger/fabric/common/configtx"
-	configtxapi "github.com/hyperledger/fabric/common/configtx/api"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/errors"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/viperutil"
@@ -191,17 +190,12 @@ func GetOrdererEndpointOfChain(chainID string, signer msp.SigningIdentity, endor
 	if err != nil {
 		return nil, fmt.Errorf("Error extracting config block envelope: %s", err)
 	}
-	configtxInitializer := configtx.NewInitializer()
-	configtxManager, err := configtx.NewManagerImpl(
-		envelopeConfig,
-		configtxInitializer,
-		[]func(cm configtxapi.Manager){},
-	)
+	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig)
 	if err != nil {
 		return nil, fmt.Errorf("Error loadding config block: %s", err)
 	}
 
-	return configtxManager.ChannelConfig().OrdererAddresses(), nil
+	return bundle.ChannelConfig().OrdererAddresses(), nil
 }
 
 // SetLogLevelFromViper sets the log level for 'module' logger to the value in

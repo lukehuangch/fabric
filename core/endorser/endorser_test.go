@@ -37,6 +37,7 @@ import (
 	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/chaincode"
+	"github.com/hyperledger/fabric/core/chaincode/accesscontrol"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/core/container"
@@ -104,7 +105,8 @@ func initPeer(chainID string) (*testEnvironment, error) {
 	}
 
 	ccStartupTimeout := time.Duration(30000) * time.Millisecond
-	pb.RegisterChaincodeSupportServer(grpcServer, chaincode.NewChaincodeSupport(getPeerEndpoint, false, ccStartupTimeout))
+	ca, _ := accesscontrol.NewCA()
+	pb.RegisterChaincodeSupportServer(grpcServer, chaincode.NewChaincodeSupport(getPeerEndpoint, false, ccStartupTimeout, ca))
 
 	syscc.RegisterSysCCs()
 
@@ -366,6 +368,29 @@ func TestJavaDeploy(t *testing.T) {
 		return
 	}
 	chaincode.GetChain().Stop(context.Background(), cccid, &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec})
+}
+
+func TestJavaCheckWithDifferentPackageTypes(t *testing.T) {
+	//try SignedChaincodeDeploymentSpec with go chaincode (type 1)
+	spec := &pb.ChaincodeSpec{Type: 1, ChaincodeId: &pb.ChaincodeID{Name: "gocc", Path: "path/to/cc", Version: "0"}, Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("someargs")}}}
+	cds := &pb.ChaincodeDeploymentSpec{ChaincodeSpec: spec, CodePackage: []byte("some code")}
+	env := &common.Envelope{Payload: pbutils.MarshalOrPanic(&common.Payload{Data: pbutils.MarshalOrPanic(&pb.SignedChaincodeDeploymentSpec{ChaincodeDeploymentSpec: pbutils.MarshalOrPanic(cds)})})}
+	//wrap the package in an invocation spec to lscc...
+	b := pbutils.MarshalOrPanic(env)
+
+	lsccCID := &pb.ChaincodeID{Name: "lscc", Version: util.GetSysCCVersion()}
+	lsccSpec := &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{Type: pb.ChaincodeSpec_GOLANG, ChaincodeId: lsccCID, Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("install"), b}}}}
+
+	e := &Endorser{}
+	err := e.disableJavaCCInst(lsccCID, lsccSpec)
+	assert.Nil(t, err)
+
+	//now try plain ChaincodeDeploymentSpec...should succeed (go chaincode)
+	b = pbutils.MarshalOrPanic(cds)
+
+	lsccSpec = &pb.ChaincodeInvocationSpec{ChaincodeSpec: &pb.ChaincodeSpec{Type: pb.ChaincodeSpec_GOLANG, ChaincodeId: lsccCID, Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("install"), b}}}}
+	err = e.disableJavaCCInst(lsccCID, lsccSpec)
+	assert.Nil(t, err)
 }
 
 //TestRedeploy - deploy two times, second time should fail but example02 should remain deployed
@@ -721,7 +746,9 @@ func TestMain(m *testing.M) {
 		return
 	}
 
-	endorserServer = NewEndorserServer()
+	endorserServer = NewEndorserServer(func(channel string, txID string, privateData []byte) error {
+		return nil
+	})
 
 	// setup the MSP manager so that we can sign/verify
 	err = msptesttools.LoadMSPSetupForTesting()

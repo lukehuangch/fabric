@@ -9,6 +9,7 @@ package channel
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/hyperledger/fabric/gossip/util"
 	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/op/go-logging"
+	"github.com/pkg/errors"
 )
 
 // Config is a configuration item
@@ -45,6 +47,10 @@ type GossipChannel interface {
 
 	// GetPeers returns a list of peers with metadata as published by them
 	GetPeers() []discovery.NetworkMember
+
+	// PeerFilter receives a SubChannelSelectionCriteria and returns a RoutingFilter that selects
+	// only peer identities that match the given criteria
+	PeerFilter(api.SubChannelSelectionCriteria) filter.RoutingFilter
 
 	// IsMemberInChan checks whether the given member is eligible to be in the channel
 	IsMemberInChan(member discovery.NetworkMember) bool
@@ -127,6 +133,7 @@ type gossipChannel struct {
 	stateInfoPublishScheduler *time.Ticker
 	stateInfoRequestScheduler *time.Ticker
 	memFilter                 *membershipFilter
+	ledgerHeight              uint64
 }
 
 type membershipFilter struct {
@@ -181,7 +188,49 @@ func NewGossipChannel(pkiID common.PKIidType, org api.OrgIdentityType, mcs api.M
 		pkiID := o.(*proto.SignedGossipMessage).GetStateInfo().PkiId
 		return gc.Lookup(pkiID) == nil
 	}
-	gc.stateInfoMsgStore = newStateInfoCache(gc.GetConf().StateInfoCacheSweepInterval, hashPeerExpiredInMembership)
+	verifyStateInfoMsg := func(msg *proto.SignedGossipMessage, orgs ...api.OrgIdentityType) bool {
+		si := msg.GetStateInfo()
+		// No point in verifying ourselves
+		if bytes.Equal(gc.pkiID, si.PkiId) {
+			return true
+		}
+		peerIdentity := adapter.GetIdentityByPKIID(si.PkiId)
+		if len(peerIdentity) == 0 {
+			gc.logger.Warning("Identity for peer", si.PkiId, "doesn't exist")
+			return false
+		}
+		isOrgInChan := func(org api.OrgIdentityType) bool {
+			if len(orgs) == 0 {
+				if !gc.IsOrgInChannel(org) {
+					return false
+				}
+			} else {
+				found := false
+				for _, chanMember := range orgs {
+					if bytes.Equal(chanMember, org) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			}
+			return true
+		}
+
+		org := gc.GetOrgOfPeer(si.PkiId)
+		if !isOrgInChan(org) {
+			gc.logger.Warning("peer", peerIdentity, "'s organization(", string(org), ") isn't in the channel", string(chainID))
+			return false
+		}
+		if err := gc.mcs.VerifyByChannel(chainID, peerIdentity, msg.Signature, msg.Payload); err != nil {
+			gc.logger.Warningf("Peer %v isn't eligible for channel %s : %+v", peerIdentity, string(chainID), errors.WithStack(err))
+			return false
+		}
+		return true
+	}
+	gc.stateInfoMsgStore = newStateInfoCache(gc.GetConf().StateInfoCacheSweepInterval, hashPeerExpiredInMembership, verifyStateInfoMsg)
 
 	ttl := election.GetMsgExpirationTimeout()
 	pol := proto.NewGossipMessageComparator(0)
@@ -241,7 +290,7 @@ func (gc *gossipChannel) GetPeers() []discovery.NetworkMember {
 func (gc *gossipChannel) requestStateInfo() {
 	req, err := gc.createStateInfoRequest()
 	if err != nil {
-		gc.logger.Warning("Failed creating SignedGossipMessage:", err)
+		gc.logger.Warningf("Failed creating SignedGossipMessage: %+v", errors.WithStack(err))
 		return
 	}
 	endpoints := filter.SelectPeers(gc.GetConf().PullPeerNum, gc.GetMembership(), gc.IsMemberInChan)
@@ -293,6 +342,27 @@ func (gc *gossipChannel) createBlockPuller() pull.Mediator {
 			gc.DeMultiplex(msg)
 		},
 	}
+
+	adapter.IngressDigFilter = func(digestMsg *proto.DataDigest) *proto.DataDigest {
+		gc.RLock()
+		height := gc.ledgerHeight
+		gc.RUnlock()
+		digests := digestMsg.Digests
+		digestMsg.Digests = nil
+		for i := range digests {
+			seqNum, err := strconv.ParseUint(digests[i], 10, 64)
+			if err != nil {
+				gc.logger.Warningf("Can't parse digest %s : %+v", digests[i], errors.WithStack(err))
+				continue
+			}
+			if seqNum >= height {
+				digestMsg.Digests = append(digestMsg.Digests, digests[i])
+			}
+
+		}
+		return digestMsg
+	}
+
 	return pull.NewPullMediator(conf, adapter)
 }
 
@@ -304,6 +374,27 @@ func (gc *gossipChannel) IsMemberInChan(member discovery.NetworkMember) bool {
 	}
 
 	return gc.IsOrgInChannel(org)
+}
+
+// PeerFilter receives a SubChannelSelectionCriteria and returns a RoutingFilter that selects
+// only peer identities that match the given criteria
+func (gc *gossipChannel) PeerFilter(messagePredicate api.SubChannelSelectionCriteria) filter.RoutingFilter {
+	return func(member discovery.NetworkMember) bool {
+		peerIdentity := gc.GetIdentityByPKIID(member.PKIid)
+		if len(peerIdentity) == 0 {
+			return false
+		}
+		msg := gc.stateInfoMsgStore.MembershipStore.MsgByID(member.PKIid)
+		if msg == nil {
+			return false
+		}
+
+		return messagePredicate(api.PeerSignature{
+			Message:      msg.Payload,
+			Signature:    msg.Signature,
+			PeerIdentity: peerIdentity,
+		})
+	}
 }
 
 // IsOrgInChannel returns whether the given organization is in the channel
@@ -321,17 +412,16 @@ func (gc *gossipChannel) IsOrgInChannel(membersOrg api.OrgIdentityType) bool {
 // EligibleForChannel returns whether the given member should get blocks
 // for this channel
 func (gc *gossipChannel) EligibleForChannel(member discovery.NetworkMember) bool {
-	if !gc.IsMemberInChan(member) {
+	peerIdentity := gc.GetIdentityByPKIID(member.PKIid)
+	if len(peerIdentity) == 0 {
+		gc.logger.Warning("Identity for peer", member.PKIid, "doesn't exist")
 		return false
 	}
-
-	identity := gc.GetIdentityByPKIID(member.PKIid)
 	msg := gc.stateInfoMsgStore.MsgByID(member.PKIid)
-	if msg == nil || identity == nil {
+	if msg == nil {
 		return false
 	}
-
-	return gc.mcs.VerifyByChannel(gc.chainID, identity, msg.Envelope.Signature, msg.Envelope.Payload) == nil
+	return true
 }
 
 // AddToMsgStore adds a given GossipMessage to the message store
@@ -368,6 +458,7 @@ func (gc *gossipChannel) ConfigureChannel(joinMsg api.JoinChannelMessage) {
 
 	gc.orgs = joinMsg.Members()
 	gc.joinMsg = joinMsg
+	gc.stateInfoMsgStore.validate(joinMsg.Members())
 }
 
 // HandleMessage processes a message sent by a remote peer
@@ -436,6 +527,7 @@ func (gc *gossipChannel) HandleMessage(msg proto.ReceivedMessage) {
 		}
 		return
 	}
+
 	if m.IsPullMsg() && m.GetPullMsgType() == proto.PullMsgType_BLOCK_MSG {
 		// If we don't have a StateInfo message from the peer,
 		// no way of validating its eligibility in the channel.
@@ -455,7 +547,7 @@ func (gc *gossipChannel) HandleMessage(msg proto.ReceivedMessage) {
 			for _, item := range m.GetDataUpdate().Data {
 				gMsg, err := item.ToGossipMessage()
 				if err != nil {
-					gc.logger.Warning("Data update contains an invalid message:", err)
+					gc.logger.Warningf("Data update contains an invalid message: %+v", errors.WithStack(err))
 					return
 				}
 				if !bytes.Equal(gMsg.Channel, []byte(gc.chainID)) {
@@ -497,7 +589,7 @@ func (gc *gossipChannel) handleStateInfSnapshot(m *proto.GossipMessage, sender c
 	for _, envelope := range m.GetStateSnapshot().Elements {
 		stateInf, err := envelope.ToGossipMessage()
 		if err != nil {
-			gc.logger.Warning("Channel", chanName, ": StateInfo snapshot contains an invalid message:", err)
+			gc.logger.Warningf("Channel %s : StateInfo snapshot contains an invalid message: %+v", chanName, errors.WithStack(err))
 			return
 		}
 		if !stateInf.IsStateInfoMsg() {
@@ -527,8 +619,7 @@ func (gc *gossipChannel) handleStateInfSnapshot(m *proto.GossipMessage, sender c
 		}
 		err = gc.ValidateStateInfoMessage(stateInf)
 		if err != nil {
-			gc.logger.Warning("Channel", chanName, ": Failed validating state info message:",
-				stateInf, ":", err, "sent from", sender)
+			gc.logger.Warningf("Channel %s: Failed validating state info message: %v sent from %v : %+v", chanName, stateInf, sender, errors.WithStack(err))
 			return
 		}
 
@@ -556,7 +647,7 @@ func (gc *gossipChannel) verifyBlock(msg *proto.GossipMessage, sender common.PKI
 	rawBlock := payload.Data
 	err := gc.mcs.VerifyBlock(msg.Channel, seqNum, rawBlock)
 	if err != nil {
-		gc.logger.Warning("Received fabricated block from", sender, "in DataUpdate:", err)
+		gc.logger.Warningf("Received fabricated block from %v in DataUpdate: %+v", sender, errors.WithStack(err))
 		return false
 	}
 	return true
@@ -656,17 +747,27 @@ func (gc *gossipChannel) UpdateStateInfo(msg *proto.SignedGossipMessage) {
 	if !msg.IsStateInfoMsg() {
 		return
 	}
-	gc.stateInfoMsgStore.Add(msg)
+
 	gc.Lock()
 	defer gc.Unlock()
+
+	nodeMeta, err := common.FromBytes(msg.GetStateInfo().Metadata)
+	if err != nil {
+		gc.logger.Warningf("Can't extract ledger height from metadata %+v", errors.WithStack(err))
+		return
+	}
+	gc.stateInfoMsgStore.Add(msg)
+	gc.ledgerHeight = nodeMeta.LedgerHeight
 	gc.stateInfoMsg = msg
 	atomic.StoreInt32(&gc.shouldGossipStateInfo, int32(1))
 }
 
-func newStateInfoCache(sweepInterval time.Duration, hasExpired func(interface{}) bool) *stateInfoCache {
+func newStateInfoCache(sweepInterval time.Duration, hasExpired func(interface{}) bool, verifyFunc membershipPredicate) *stateInfoCache {
 	membershipStore := util.NewMembershipStore()
 	pol := proto.NewGossipMessageComparator(0)
+
 	s := &stateInfoCache{
+		verify:          verifyFunc,
 		MembershipStore: membershipStore,
 		stopChan:        make(chan struct{}),
 	}
@@ -689,25 +790,54 @@ func newStateInfoCache(sweepInterval time.Duration, hasExpired func(interface{})
 	return s
 }
 
+// membershipPredicate receives a StateInfoMessage and optionally a slice of organization identifiers
+// and returns whether the peer that signed the given StateInfoMessage is eligible
+// to the channel or not
+type membershipPredicate func(msg *proto.SignedGossipMessage, orgs ...api.OrgIdentityType) bool
+
 // stateInfoCache is actually a messageStore
 // that also indexes messages that are added
 // so that they could be extracted later
 type stateInfoCache struct {
+	verify membershipPredicate
 	*util.MembershipStore
 	msgstore.MessageStore
 	stopChan chan struct{}
+}
+
+func (cache *stateInfoCache) validate(orgs []api.OrgIdentityType) {
+	for _, m := range cache.Get() {
+		msg := m.(*proto.SignedGossipMessage)
+		if !cache.verify(msg, orgs...) {
+			cache.delete(msg)
+		}
+	}
 }
 
 // Add attempts to add the given message to the stateInfoCache,
 // and if the message was added, also indexes it.
 // Message must be a StateInfo message.
 func (cache *stateInfoCache) Add(msg *proto.SignedGossipMessage) bool {
+	if !cache.MessageStore.CheckValid(msg) {
+		return false
+	}
+	if !cache.verify(msg) {
+		return false
+	}
 	added := cache.MessageStore.Add(msg)
 	if added {
 		pkiID := msg.GetStateInfo().PkiId
 		cache.MembershipStore.Put(pkiID, msg)
 	}
 	return added
+}
+
+func (cache *stateInfoCache) delete(msg *proto.SignedGossipMessage) {
+	cache.Purge(func(o interface{}) bool {
+		pkiID := o.(*proto.SignedGossipMessage).GetStateInfo().PkiId
+		return bytes.Equal(pkiID, msg.GetStateInfo().PkiId)
+	})
+	cache.Remove(msg.GetStateInfo().PkiId)
 }
 
 func (cache *stateInfoCache) Stop() {

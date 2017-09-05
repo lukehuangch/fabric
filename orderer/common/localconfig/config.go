@@ -32,7 +32,7 @@ import (
 	"path/filepath"
 
 	bccsp "github.com/hyperledger/fabric/bccsp/factory"
-	"github.com/hyperledger/fabric/common/configtx/tool/provisional"
+	"github.com/hyperledger/fabric/common/tools/configtxgen/provisional"
 )
 
 const (
@@ -65,6 +65,7 @@ type TopLevel struct {
 	FileLedger FileLedger
 	RAMLedger  RAMLedger
 	Kafka      Kafka
+	Debug      Debug
 }
 
 // General contains config which should be common among all orderer types.
@@ -79,6 +80,7 @@ type General struct {
 	GenesisFile    string
 	Profile        Profile
 	LogLevel       string
+	LogFormat      string
 	LocalMSPDir    string
 	LocalMSPID     string
 	BCCSP          *bccsp.FactoryOpts
@@ -162,6 +164,12 @@ type Consumer struct {
 	RetryBackoff time.Duration
 }
 
+// Debug contains configuration for the orderer's debug parameters
+type Debug struct {
+	BroadcastTraceDir string
+	DeliverTraceDir   string
+}
+
 var defaults = TopLevel{
 	General: General{
 		LedgerType:     "file",
@@ -176,6 +184,7 @@ var defaults = TopLevel{
 			Address: "0.0.0.0:6060",
 		},
 		LogLevel:    "INFO",
+		LogFormat:   "%{color}%{time:2006-01-02 15:04:05.000 MST} [%{module}] %{shortfunc} -> %{level:.4s} %{id:03x}%{color:reset} %{message}",
 		LocalMSPDir: "msp",
 		LocalMSPID:  "DEFAULT",
 		BCCSP:       bccsp.GetDefaultOpts(),
@@ -211,10 +220,14 @@ var defaults = TopLevel{
 			},
 		},
 		Verbose: false,
-		Version: sarama.V0_9_0_1,
+		Version: sarama.V0_10_1_0,
 		TLS: TLS{
 			Enabled: false,
 		},
+	},
+	Debug: Debug{
+		BroadcastTraceDir: "",
+		DeliverTraceDir:   "",
 	},
 }
 
@@ -272,6 +285,9 @@ func (c *TopLevel) completeInitialization(configDir string) {
 		case c.General.LogLevel == "":
 			logger.Infof("General.LogLevel unset, setting to %s", defaults.General.LogLevel)
 			c.General.LogLevel = defaults.General.LogLevel
+		case c.General.LogFormat == "":
+			logger.Infof("General.LogFormat unset, setting to %s", defaults.General.LogFormat)
+			c.General.LogFormat = defaults.General.LogFormat
 
 		case c.General.GenesisMethod == "":
 			c.General.GenesisMethod = defaults.General.GenesisMethod

@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package comm
 
 import (
-	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -15,6 +15,7 @@ import (
 	"github.com/hyperledger/fabric/gossip/util"
 	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/op/go-logging"
+	"github.com/pkg/errors"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
@@ -51,7 +52,7 @@ func (cs *connectionStore) getConnection(peer *RemotePeer) (*connection, error) 
 	cs.RUnlock()
 
 	if isClosing {
-		return nil, errors.New("Shutting down")
+		return nil, fmt.Errorf("Shutting down")
 	}
 
 	pkiID := peer.PKIID
@@ -84,7 +85,7 @@ func (cs *connectionStore) getConnection(peer *RemotePeer) (*connection, error) 
 	isClosing = cs.isClosing
 	cs.RUnlock()
 	if isClosing {
-		return nil, errors.New("ConnStore is closing")
+		return nil, fmt.Errorf("ConnStore is closing")
 	}
 
 	cs.Lock()
@@ -323,7 +324,7 @@ func (conn *connection) readFromStream(errChan chan error, msgChan chan *proto.S
 		stream := conn.getStream()
 		if stream == nil {
 			conn.logger.Error(conn.pkiID, "Stream is nil, aborting!")
-			errChan <- errors.New("Stream is nil")
+			errChan <- fmt.Errorf("Stream is nil")
 			return
 		}
 		envelope, err := stream.Recv()
@@ -333,13 +334,13 @@ func (conn *connection) readFromStream(errChan chan error, msgChan chan *proto.S
 		}
 		if err != nil {
 			errChan <- err
-			conn.logger.Debug(conn.pkiID, "Got error, aborting:", err)
+			conn.logger.Debugf("%v Got error, aborting: %v", err)
 			return
 		}
 		msg, err := envelope.ToGossipMessage()
 		if err != nil {
 			errChan <- err
-			conn.logger.Warning(conn.pkiID, "Got error, aborting:", err)
+			conn.logger.Warning("%v Got error, aborting: %v", err)
 		}
 		msgChan <- msg
 	}
@@ -350,8 +351,8 @@ func (conn *connection) getStream() stream {
 	defer conn.Unlock()
 
 	if conn.clientStream != nil && conn.serverStream != nil {
-		e := "Both client and server stream are not nil, something went wrong"
-		conn.logger.Error(e)
+		e := errors.New("Both client and server stream are not nil, something went wrong")
+		conn.logger.Errorf("%+v", e)
 	}
 
 	if conn.clientStream != nil {

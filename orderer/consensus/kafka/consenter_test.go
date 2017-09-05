@@ -134,7 +134,10 @@ func newMockConsumerMessage(wrappedMessage *ab.KafkaMessage) *sarama.ConsumerMes
 }
 
 func newMockEnvelope(content string) *cb.Envelope {
-	return &cb.Envelope{Payload: []byte(content)}
+	return &cb.Envelope{Payload: utils.MarshalOrPanic(&cb.Payload{
+		Header: &cb.Header{ChannelHeader: utils.MarshalOrPanic(&cb.ChannelHeader{ChannelId: "foo"})},
+		Data:   []byte(content),
+	})}
 }
 
 func newMockLocalConfig(enableTLS bool, retryOptions localconfig.Retry, verboseLog bool) *localconfig.TopLevel {
@@ -147,7 +150,7 @@ func newMockLocalConfig(enableTLS bool, retryOptions localconfig.Retry, verboseL
 		Kafka: localconfig.Kafka{
 			Retry:   retryOptions,
 			Verbose: verboseLog,
-			Version: sarama.V0_9_0_1,
+			Version: sarama.V0_9_0_1, // sarama.MockBroker only produces messages compatible with version < 0.10
 		},
 	}
 }

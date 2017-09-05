@@ -12,17 +12,17 @@ package multichannel
 import (
 	"fmt"
 
-	"github.com/hyperledger/fabric/common/config"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	configtxapi "github.com/hyperledger/fabric/common/configtx/api"
-	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/orderer/common/ledger"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	"github.com/hyperledger/fabric/orderer/consensus"
 	cb "github.com/hyperledger/fabric/protos/common"
+	ab "github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protos/utils"
 	"github.com/op/go-logging"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/hyperledger/fabric/common/crypto"
 )
 
@@ -33,21 +33,35 @@ const (
 	epoch      = 0
 )
 
-type configResources struct {
-	configtxapi.Manager
+type mutableResources interface {
+	channelconfig.Resources
+	Update(*channelconfig.Bundle)
 }
 
-func (cr *configResources) SharedConfig() config.Orderer {
+type configResources struct {
+	mutableResources
+}
+
+func (cr *configResources) CreateBundle(channelID string, config *cb.Config) (*channelconfig.Bundle, error) {
+	return channelconfig.NewBundle(channelID, config)
+}
+
+func (cr *configResources) Update(bndl *channelconfig.Bundle) {
+	channelconfig.LogSanityChecks(bndl)
+	cr.mutableResources.Update(bndl)
+}
+
+func (cr *configResources) SharedConfig() channelconfig.Orderer {
 	oc, ok := cr.OrdererConfig()
 	if !ok {
-		logger.Panicf("[channel %s] has no orderer configuration", cr.ChainID())
+		logger.Panicf("[channel %s] has no orderer configuration", cr.ConfigtxManager().ChainID())
 	}
 	return oc
 }
 
 type ledgerResources struct {
 	*configResources
-	ledger ledger.ReadWriter
+	ledger.ReadWriter
 }
 
 // Registrar serves as a point of access and control for the individual channel resources.
@@ -58,6 +72,7 @@ type Registrar struct {
 	signer          crypto.LocalSigner
 	systemChannelID string
 	systemChannel   *ChainSupport
+	templator       msgprocessor.ChannelConfigTemplator
 }
 
 func getConfigTx(reader ledger.Reader) *cb.Envelope {
@@ -94,17 +109,32 @@ func NewRegistrar(ledgerFactory ledger.Factory, consenters map[string]consensus.
 			logger.Panic("Programming error, configTx should never be nil here")
 		}
 		ledgerResources := r.newLedgerResources(configTx)
-		chainID := ledgerResources.ChainID()
+		chainID := ledgerResources.ConfigtxManager().ChainID()
 
 		if _, ok := ledgerResources.ConsortiumsConfig(); ok {
 			if r.systemChannelID != "" {
 				logger.Panicf("There appear to be two system chains %s and %s", r.systemChannelID, chainID)
 			}
-			chain := newChainSupport(createSystemChainFilters(r, ledgerResources),
+			chain := newChainSupport(
+				r,
 				ledgerResources,
 				consenters,
 				signer)
-			logger.Infof("Starting with system channel %s and orderer type %s", chainID, chain.SharedConfig().ConsensusType())
+			r.templator = msgprocessor.NewDefaultTemplator(chain)
+			chain.Processor = msgprocessor.NewSystemChannel(chain, r.templator, msgprocessor.CreateSystemChannelFilters(r, chain))
+
+			// Retrieve genesis block to log its hash. See FAB-5450 for the purpose
+			iter, pos := rl.Iterator(&ab.SeekPosition{Type: &ab.SeekPosition_Oldest{Oldest: &ab.SeekOldest{}}})
+			defer iter.Close()
+			if pos != uint64(0) {
+				logger.Panicf("Error iterating over system channel: '%s', expected position 0, got %d", chainID, pos)
+			}
+			genesisBlock, status := iter.Next()
+			if status != cb.Status_SUCCESS {
+				logger.Panicf("Error reading genesis block of system channel '%s'", chainID)
+			}
+			logger.Infof("Starting system channel '%s' with genesis block hash %x and orderer type %s", chainID, genesisBlock.Header.Hash(), chain.SharedConfig().ConsensusType())
+
 			r.chains[chainID] = chain
 			r.systemChannelID = chainID
 			r.systemChannel = chain
@@ -112,7 +142,8 @@ func NewRegistrar(ledgerFactory ledger.Factory, consenters map[string]consensus.
 			defer chain.start()
 		} else {
 			logger.Debugf("Starting chain: %s", chainID)
-			chain := newChainSupport(createStandardFilters(ledgerResources),
+			chain := newChainSupport(
+				r,
 				ledgerResources,
 				consenters,
 				signer)
@@ -134,6 +165,35 @@ func (r *Registrar) SystemChannelID() string {
 	return r.systemChannelID
 }
 
+// BroadcastChannelSupport returns the message channel header, whether the message is a config update
+// and the channel resources for a message or an error if the message is not a message which can
+// be processed directly (like CONFIG and ORDERER_TRANSACTION messages)
+func (r *Registrar) BroadcastChannelSupport(msg *cb.Envelope) (*cb.ChannelHeader, bool, *ChainSupport, error) {
+	chdr, err := utils.ChannelHeader(msg)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("could not determine channel ID: %s", err)
+	}
+
+	cs, ok := r.chains[chdr.ChannelId]
+	if !ok {
+		cs = r.systemChannel
+	}
+
+	class, err := cs.ClassifyMsg(chdr)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("could not classify message: %s", err)
+	}
+
+	isConfig := false
+	switch class {
+	case msgprocessor.ConfigUpdateMsg:
+		isConfig = true
+	default:
+	}
+
+	return chdr, isConfig, cs, nil
+}
+
 // GetChain retrieves the chain support for a chain (and whether it exists)
 func (r *Registrar) GetChain(chainID string) (*ChainSupport, bool) {
 	cs, ok := r.chains[chainID]
@@ -141,28 +201,45 @@ func (r *Registrar) GetChain(chainID string) (*ChainSupport, bool) {
 }
 
 func (r *Registrar) newLedgerResources(configTx *cb.Envelope) *ledgerResources {
-	initializer := configtx.NewInitializer()
-	configManager, err := configtx.NewManagerImpl(configTx, initializer, nil)
+	payload, err := utils.UnmarshalPayload(configTx.Payload)
 	if err != nil {
-		logger.Panicf("Error creating configtx manager and handlers: %s", err)
+		logger.Panicf("Error umarshaling envelope to payload: %s", err)
 	}
 
-	chainID := configManager.ChainID()
+	if payload.Header == nil {
+		logger.Panicf("Missing channel header: %s", err)
+	}
 
-	ledger, err := r.ledgerFactory.GetOrCreate(chainID)
+	chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
 	if err != nil {
-		logger.Panicf("Error getting ledger for %s", chainID)
+		logger.Panicf("Error unmarshaling channel header: %s", err)
+	}
+
+	configEnvelope, err := configtx.UnmarshalConfigEnvelope(payload.Data)
+	if err != nil {
+		logger.Panicf("Error umarshaling config envelope from payload data: %s", err)
+	}
+
+	bundle, err := channelconfig.NewBundle(chdr.ChannelId, configEnvelope.Config)
+	if err != nil {
+		logger.Panicf("Error creating channelconfig bundle: %s", err)
+	}
+	channelconfig.LogSanityChecks(bundle)
+
+	ledger, err := r.ledgerFactory.GetOrCreate(chdr.ChannelId)
+	if err != nil {
+		logger.Panicf("Error getting ledger for %s", chdr.ChannelId)
 	}
 
 	return &ledgerResources{
-		configResources: &configResources{Manager: configManager},
-		ledger:          ledger,
+		configResources: &configResources{mutableResources: channelconfig.NewBundleSource(bundle)},
+		ReadWriter:      ledger,
 	}
 }
 
 func (r *Registrar) newChain(configtx *cb.Envelope) {
 	ledgerResources := r.newLedgerResources(configtx)
-	ledgerResources.ledger.Append(ledger.CreateNextBlock(ledgerResources.ledger, []*cb.Envelope{configtx}))
+	ledgerResources.Append(ledger.CreateNextBlock(ledgerResources, []*cb.Envelope{configtx}))
 
 	// Copy the map to allow concurrent reads from broadcast/deliver while the new chainSupport is
 	newChains := make(map[string]*ChainSupport)
@@ -170,8 +247,8 @@ func (r *Registrar) newChain(configtx *cb.Envelope) {
 		newChains[key] = value
 	}
 
-	cs := newChainSupport(createStandardFilters(ledgerResources), ledgerResources, r.consenters, r.signer)
-	chainID := ledgerResources.ChainID()
+	cs := newChainSupport(r, ledgerResources, r.consenters, r.signer)
+	chainID := ledgerResources.ConfigtxManager().ChainID()
 
 	logger.Infof("Created and starting new chain %s", chainID)
 
@@ -181,134 +258,12 @@ func (r *Registrar) newChain(configtx *cb.Envelope) {
 	r.chains = newChains
 }
 
-func (r *Registrar) channelsCount() int {
+// ChannelsCount returns the count of the current total number of channels.
+func (r *Registrar) ChannelsCount() int {
 	return len(r.chains)
 }
 
 // NewChannelConfig produces a new template channel configuration based on the system channel's current config.
 func (r *Registrar) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) {
-	configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload)
-	if err != nil {
-		return nil, fmt.Errorf("Failing initial channel config creation because of payload unmarshaling error: %s", err)
-	}
-
-	configUpdateEnv, err := configtx.UnmarshalConfigUpdateEnvelope(configUpdatePayload.Data)
-	if err != nil {
-		return nil, fmt.Errorf("Failing initial channel config creation because of config update envelope unmarshaling error: %s", err)
-	}
-
-	if configUpdatePayload.Header == nil {
-		return nil, fmt.Errorf("Failed initial channel config creation because config update header was missing")
-	}
-	channelHeader, err := utils.UnmarshalChannelHeader(configUpdatePayload.Header.ChannelHeader)
-
-	configUpdate, err := configtx.UnmarshalConfigUpdate(configUpdateEnv.ConfigUpdate)
-	if err != nil {
-		return nil, fmt.Errorf("Failing initial channel config creation because of config update unmarshaling error: %s", err)
-	}
-
-	if configUpdate.ChannelId != channelHeader.ChannelId {
-		return nil, fmt.Errorf("Failing initial channel config creation: mismatched channel IDs: '%s' != '%s'", configUpdate.ChannelId, channelHeader.ChannelId)
-	}
-
-	if configUpdate.WriteSet == nil {
-		return nil, fmt.Errorf("Config update has an empty writeset")
-	}
-
-	if configUpdate.WriteSet.Groups == nil || configUpdate.WriteSet.Groups[config.ApplicationGroupKey] == nil {
-		return nil, fmt.Errorf("Config update has missing application group")
-	}
-
-	if uv := configUpdate.WriteSet.Groups[config.ApplicationGroupKey].Version; uv != 1 {
-		return nil, fmt.Errorf("Config update for channel creation does not set application group version to 1, was %d", uv)
-	}
-
-	consortiumConfigValue, ok := configUpdate.WriteSet.Values[config.ConsortiumKey]
-	if !ok {
-		return nil, fmt.Errorf("Consortium config value missing")
-	}
-
-	consortium := &cb.Consortium{}
-	err = proto.Unmarshal(consortiumConfigValue.Value, consortium)
-	if err != nil {
-		return nil, fmt.Errorf("Error reading unmarshaling consortium name: %s", err)
-	}
-
-	applicationGroup := cb.NewConfigGroup()
-	consortiumsConfig, ok := r.systemChannel.ConsortiumsConfig()
-	if !ok {
-		return nil, fmt.Errorf("The ordering system channel does not appear to support creating channels")
-	}
-
-	consortiumConf, ok := consortiumsConfig.Consortiums()[consortium.Name]
-	if !ok {
-		return nil, fmt.Errorf("Unknown consortium name: %s", consortium.Name)
-	}
-
-	applicationGroup.Policies[config.ChannelCreationPolicyKey] = &cb.ConfigPolicy{
-		Policy: consortiumConf.ChannelCreationPolicy(),
-	}
-	applicationGroup.ModPolicy = config.ChannelCreationPolicyKey
-
-	// Get the current system channel config
-	systemChannelGroup := r.systemChannel.ConfigEnvelope().Config.ChannelGroup
-
-	// If the consortium group has no members, allow the source request to have no members.  However,
-	// if the consortium group has any members, there must be at least one member in the source request
-	if len(systemChannelGroup.Groups[config.ConsortiumsGroupKey].Groups[consortium.Name].Groups) > 0 &&
-		len(configUpdate.WriteSet.Groups[config.ApplicationGroupKey].Groups) == 0 {
-		return nil, fmt.Errorf("Proposed configuration has no application group members, but consortium contains members")
-	}
-
-	// If the consortium has no members, allow the source request to contain arbitrary members
-	// Otherwise, require that the supplied members are a subset of the consortium members
-	if len(systemChannelGroup.Groups[config.ConsortiumsGroupKey].Groups[consortium.Name].Groups) > 0 {
-		for orgName := range configUpdate.WriteSet.Groups[config.ApplicationGroupKey].Groups {
-			consortiumGroup, ok := systemChannelGroup.Groups[config.ConsortiumsGroupKey].Groups[consortium.Name].Groups[orgName]
-			if !ok {
-				return nil, fmt.Errorf("Attempted to include a member which is not in the consortium")
-			}
-			applicationGroup.Groups[orgName] = consortiumGroup
-		}
-	}
-
-	channelGroup := cb.NewConfigGroup()
-
-	// Copy the system channel Channel level config to the new config
-	for key, value := range systemChannelGroup.Values {
-		channelGroup.Values[key] = value
-		if key == config.ConsortiumKey {
-			// Do not set the consortium name, we do this later
-			continue
-		}
-	}
-
-	for key, policy := range systemChannelGroup.Policies {
-		channelGroup.Policies[key] = policy
-	}
-
-	// Set the new config orderer group to the system channel orderer group and the application group to the new application group
-	channelGroup.Groups[config.OrdererGroupKey] = systemChannelGroup.Groups[config.OrdererGroupKey]
-	channelGroup.Groups[config.ApplicationGroupKey] = applicationGroup
-	channelGroup.Values[config.ConsortiumKey] = config.TemplateConsortium(consortium.Name).Values[config.ConsortiumKey]
-
-	templateConfig, _ := utils.CreateSignedEnvelope(cb.HeaderType_CONFIG, configUpdate.ChannelId, r.signer, &cb.ConfigEnvelope{
-		Config: &cb.Config{
-			ChannelGroup: channelGroup,
-		},
-	}, msgVersion, epoch)
-
-	initializer := configtx.NewInitializer()
-
-	// This is a very hacky way to disable the sanity check logging in the policy manager
-	// for the template configuration, but it is the least invasive near a release
-	pm, ok := initializer.PolicyManager().(*policies.ManagerImpl)
-	if ok {
-		pm.SuppressSanityLogMessages = true
-		defer func() {
-			pm.SuppressSanityLogMessages = false
-		}()
-	}
-
-	return configtx.NewManagerImpl(templateConfig, initializer, nil)
+	return r.templator.NewChannelConfig(envConfigUpdate)
 }

@@ -99,16 +99,24 @@ func (chain *chainImpl) Start() {
 // consensus.Chain interface.
 func (chain *chainImpl) Halt() {
 	select {
-	case <-chain.haltChan:
-		// This construct is useful because it allows Halt() to be called
-		// multiple times (by a single thread) w/o panicking. Recal that a
-		// receive from a closed channel returns (the zero value) immediately.
-		logger.Warningf("[channel: %s] Halting of chain requested again", chain.support.ChainID())
+	case <-chain.startChan:
+		// chain finished starting, so we can halt it
+		select {
+		case <-chain.haltChan:
+			// This construct is useful because it allows Halt() to be called
+			// multiple times (by a single thread) w/o panicking. Recal that a
+			// receive from a closed channel returns (the zero value) immediately.
+			logger.Warningf("[channel: %s] Halting of chain requested again", chain.support.ChainID())
+		default:
+			logger.Criticalf("[channel: %s] Halting of chain requested", chain.support.ChainID())
+			close(chain.haltChan)
+			chain.closeKafkaObjects() // Also close the producer and the consumer
+			logger.Debugf("[channel: %s] Closed the haltChan", chain.support.ChainID())
+		}
 	default:
-		logger.Criticalf("[channel: %s] Halting of chain requested", chain.support.ChainID())
-		close(chain.haltChan)
-		chain.closeKafkaObjects() // Also close the producer and the consumer
-		logger.Debugf("[channel: %s] Closed the haltChan", chain.support.ChainID())
+		logger.Warningf("[channel: %s] Waiting for chain to finish starting before halting", chain.support.ChainID())
+		<-chain.startChan
+		chain.Halt()
 	}
 }
 
@@ -332,7 +340,7 @@ func getLastOffsetPersisted(metadataValue []byte, chainID string) int64 {
 		}
 		return kafkaMetadata.LastOffsetPersisted
 	}
-	return (sarama.OffsetOldest - 1) // default
+	return sarama.OffsetOldest - 1 // default
 }
 
 func newConnectMessage() *ab.KafkaMessage {
@@ -385,7 +393,12 @@ func processRegular(regularMessage *ab.KafkaMessageRegular, support consensus.Co
 		return fmt.Errorf("unmarshal/%s", err)
 	}
 
-	class, err := support.ClassifyMsg(env)
+	chdr, err := utils.ChannelHeader(env)
+	if err != nil {
+		logger.Panicf("If a message has arrived to this point, it should already have had its header inspected once")
+	}
+
+	class, err := support.ClassifyMsg(chdr)
 	if err != nil {
 		logger.Panicf("[channel: %s] If a message has arrived to this point, it should already have been classified once", support.ChainID())
 	}
@@ -400,10 +413,14 @@ func processRegular(regularMessage *ab.KafkaMessageRegular, support consensus.Co
 		batch := support.BlockCutter().Cut()
 		if batch != nil {
 			block := support.CreateNextBlock(batch)
-			support.WriteBlock(block, nil)
+			encodedLastOffsetPersisted := utils.MarshalOrPanic(&ab.KafkaMetadata{LastOffsetPersisted: receivedOffset - 1})
+			support.WriteBlock(block, encodedLastOffsetPersisted)
+			*lastCutBlockNumber++
 		}
 		block := support.CreateNextBlock([]*cb.Envelope{env})
-		support.WriteConfigBlock(block, nil)
+		encodedLastOffsetPersisted := utils.MarshalOrPanic(&ab.KafkaMetadata{LastOffsetPersisted: receivedOffset})
+		support.WriteConfigBlock(block, encodedLastOffsetPersisted)
+		*lastCutBlockNumber++
 		*timer = nil
 	case msgprocessor.NormalMsg:
 		_, err := support.ProcessNormalMsg(env)
@@ -412,25 +429,30 @@ func processRegular(regularMessage *ab.KafkaMessageRegular, support consensus.Co
 			break
 		}
 
-		batches, ok := support.BlockCutter().Ordered(env)
-		logger.Debugf("[channel: %s] Ordering results: items in batch = %d, ok = %v", support.ChainID(), len(batches), ok)
-		if ok && len(batches) == 0 && *timer == nil {
+		batches, pending := support.BlockCutter().Ordered(env)
+		logger.Debugf("[channel: %s] Ordering results: items in batch = %d, pending = %v", support.ChainID(), len(batches), pending)
+		if len(batches) == 0 && *timer == nil {
 			*timer = time.After(support.SharedConfig().BatchTimeout())
 			logger.Debugf("[channel: %s] Just began %s batch timer", support.ChainID(), support.SharedConfig().BatchTimeout().String())
 			return nil
 		}
-		// If !ok, batches == nil, so this will be skipped
-		for i, batch := range batches {
-			// If more than one batch is produced, exactly 2 batches are produced.
-			// The receivedOffset for the first batch is one less than the supplied
-			// offset to this function.
-			offset := receivedOffset - int64(len(batches)-i-1)
+
+		offset := receivedOffset
+		if pending || len(batches) == 2 {
+			// If the newest envelope is not encapsulated into the first batch,
+			// the `LastOffsetPersisted` should be `receivedOffset` - 1.
+			offset--
+		}
+
+		for _, batch := range batches {
 			block := support.CreateNextBlock(batch)
 			encodedLastOffsetPersisted := utils.MarshalOrPanic(&ab.KafkaMetadata{LastOffsetPersisted: offset})
 			support.WriteBlock(block, encodedLastOffsetPersisted)
 			*lastCutBlockNumber++
 			logger.Debugf("[channel: %s] Batch filled, just cut block %d - last persisted offset is now %d", support.ChainID(), *lastCutBlockNumber, offset)
+			offset++
 		}
+
 		if len(batches) > 0 {
 			*timer = nil
 		}
@@ -476,8 +498,14 @@ func sendConnectMessage(retryOptions localconfig.Retry, exitChan chan struct{}, 
 
 	retryMsg := "Attempting to post the CONNECT message..."
 	postConnect := newRetryProcess(retryOptions, exitChan, channel, retryMsg, func() error {
-		_, _, err := producer.SendMessage(message)
-		return err
+		select {
+		case <-exitChan:
+			logger.Debugf("[channel: %s] Consenter for channel exiting, aborting retry", channel)
+			return nil
+		default:
+			_, _, err := producer.SendMessage(message)
+			return err
+		}
 	})
 
 	return postConnect.retry()

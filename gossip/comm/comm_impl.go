@@ -9,7 +9,6 @@ package comm
 import (
 	"bytes"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -23,6 +22,7 @@ import (
 	"github.com/hyperledger/fabric/gossip/util"
 	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/op/go-logging"
+	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -106,7 +106,7 @@ func NewCommInstance(s *grpc.Server, cert *tls.Certificate, idStore identity.Map
 	dialOpts = append(dialOpts, grpc.WithTimeout(util.GetDurationOrDefault("peer.gossip.dialTimeout", defDialTimeout)))
 	commInst, err := NewCommInstanceWithServer(-1, idStore, peerIdentity, secureDialOpts, dialOpts...)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	if cert != nil {
@@ -163,7 +163,7 @@ func (c *commImpl) createConnection(endpoint string, expectedPKIID common.PKIidT
 	dialOpts = append(dialOpts, c.opts...)
 	cc, err = grpc.Dial(endpoint, dialOpts...)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	cl := proto.NewGossipClient(cc)
@@ -172,7 +172,7 @@ func (c *commImpl) createConnection(endpoint string, expectedPKIID common.PKIidT
 	defer cancel()
 	if _, err = cl.Ping(ctx, &proto.Empty{}); err != nil {
 		cc.Close()
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	ctx, cf := context.WithCancel(context.Background())
@@ -204,10 +204,10 @@ func (c *commImpl) createConnection(endpoint string, expectedPKIID common.PKIidT
 			conn.handler = h
 			return conn, nil
 		}
-		c.logger.Warning("Authentication failed:", err)
+		c.logger.Warningf("Authentication failed: %+v", err)
 	}
 	cc.Close()
-	return nil, err
+	return nil, errors.WithStack(err)
 }
 
 func (c *commImpl) Send(msg *proto.SignedGossipMessage, peers ...*RemotePeer) {
@@ -235,13 +235,13 @@ func (c *commImpl) sendToEndpoint(peer *RemotePeer, msg *proto.SignedGossipMessa
 	conn, err := c.connStore.getConnection(peer)
 	if err == nil {
 		disConnectOnErr := func(err error) {
-			c.logger.Warning(peer, "isn't responsive:", err)
+			c.logger.Warningf("%v isn't responsive: %v", peer, err)
 			c.disconnect(peer.PKIID)
 		}
 		conn.send(msg, disConnectOnErr)
 		return
 	}
-	c.logger.Warning("Failed obtaining connection for", peer, "reason:", err)
+	c.logger.Warningf("Failed obtaining connection for %v reason: %v", peer, err)
 	c.disconnect(peer.PKIID)
 }
 
@@ -254,7 +254,7 @@ func (c *commImpl) Probe(remotePeer *RemotePeer) error {
 	endpoint := remotePeer.Endpoint
 	pkiID := remotePeer.PKIID
 	if c.isStopping() {
-		return errors.New("Stopping")
+		return fmt.Errorf("Stopping")
 	}
 	c.logger.Debug("Entering, endpoint:", endpoint, "PKIID:", pkiID)
 	dialOpts = append(dialOpts, c.secureDialOpts()...)
@@ -263,7 +263,7 @@ func (c *commImpl) Probe(remotePeer *RemotePeer) error {
 
 	cc, err := grpc.Dial(remotePeer.Endpoint, dialOpts...)
 	if err != nil {
-		c.logger.Debug("Returning", err)
+		c.logger.Debugf("Returning %v", err)
 		return err
 	}
 	defer cc.Close()
@@ -271,7 +271,7 @@ func (c *commImpl) Probe(remotePeer *RemotePeer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defConnTimeout)
 	defer cancel()
 	_, err = cl.Ping(ctx, &proto.Empty{})
-	c.logger.Debug("Returning", err)
+	c.logger.Debugf("Returning %v", err)
 	return err
 }
 
@@ -300,11 +300,11 @@ func (c *commImpl) Handshake(remotePeer *RemotePeer) (api.PeerIdentityType, erro
 	}
 	connInfo, err := c.authenticateRemotePeer(stream)
 	if err != nil {
-		c.logger.Warning("Authentication failed:", err)
+		c.logger.Warningf("Authentication failed: %v", err)
 		return nil, err
 	}
 	if len(remotePeer.PKIID) > 0 && !bytes.Equal(connInfo.ID, remotePeer.PKIID) {
-		return nil, errors.New("PKI-ID of remote peer doesn't match expected PKI-ID")
+		return nil, fmt.Errorf("PKI-ID of remote peer doesn't match expected PKI-ID")
 	}
 	return connInfo.Identity, nil
 }
@@ -405,26 +405,16 @@ func (c *commImpl) authenticateRemotePeer(stream stream) (*proto.ConnectionInfo,
 	remoteCertHash := extractCertificateHashFromContext(ctx)
 	var err error
 	var cMsg *proto.SignedGossipMessage
-	var signer proto.Signer
 	useTLS := c.selfCertHash != nil
 
-	// If TLS is enabled, sign the connection message in order to bind
-	// the TLS session to the peer's identity
-	if useTLS {
-		signer = func(msg []byte) ([]byte, error) {
-			return c.idMapper.Sign(msg)
-		}
-	} else { // If we don't use TLS, we have no unique text to sign,
-		//  so don't sign anything
-		signer = func(msg []byte) ([]byte, error) {
-			return msg, nil
-		}
+	signer := func(msg []byte) ([]byte, error) {
+		return c.idMapper.Sign(msg)
 	}
 
 	// TLS enabled but not detected on other side
 	if useTLS && len(remoteCertHash) == 0 {
 		c.logger.Warningf("%s didn't send TLS certificate", remoteAddress)
-		return nil, errors.New("No TLS certificate")
+		return nil, fmt.Errorf("No TLS certificate")
 	}
 
 	cMsg, err = c.createConnectionMsg(c.PKIID, c.selfCertHash, c.peerIdentity, signer)
@@ -442,18 +432,18 @@ func (c *commImpl) authenticateRemotePeer(stream stream) (*proto.ConnectionInfo,
 	receivedMsg := m.GetConn()
 	if receivedMsg == nil {
 		c.logger.Warning("Expected connection message from", remoteAddress, "but got", receivedMsg)
-		return nil, errors.New("Wrong type")
+		return nil, fmt.Errorf("Wrong type")
 	}
 
 	if receivedMsg.PkiId == nil {
 		c.logger.Warning("%s didn't send a pkiID", remoteAddress)
-		return nil, errors.New("No PKI-ID")
+		return nil, fmt.Errorf("No PKI-ID")
 	}
 
 	c.logger.Debug("Received", receivedMsg, "from", remoteAddress)
 	err = c.idMapper.Put(receivedMsg.PkiId, receivedMsg.Identity)
 	if err != nil {
-		c.logger.Warning("Identity store rejected", remoteAddress, ":", err)
+		c.logger.Warningf("Identity store rejected %s : %v", remoteAddress, err)
 		return nil, err
 	}
 
@@ -461,6 +451,10 @@ func (c *commImpl) authenticateRemotePeer(stream stream) (*proto.ConnectionInfo,
 		ID:       receivedMsg.PkiId,
 		Identity: receivedMsg.Identity,
 		Endpoint: remoteAddress,
+		Auth: &proto.AuthInfo{
+			Signature:  m.Signature,
+			SignedData: m.Payload,
+		},
 	}
 
 	// if TLS is enabled and detected, verify remote peer
@@ -468,21 +462,18 @@ func (c *commImpl) authenticateRemotePeer(stream stream) (*proto.ConnectionInfo,
 		// If the remote peer sent its TLS certificate, make sure it actually matches the TLS cert
 		// that the peer used.
 		if !bytes.Equal(remoteCertHash, receivedMsg.TlsCertHash) {
-			return nil, fmt.Errorf("Expected %v in remote hash of TLS cert, but got %v", remoteCertHash, receivedMsg.TlsCertHash)
+			return nil, errors.Errorf("Expected %v in remote hash of TLS cert, but got %v", remoteCertHash, receivedMsg.TlsCertHash)
 		}
-		verifier := func(peerIdentity []byte, signature, message []byte) error {
-			pkiID := c.idMapper.GetPKIidOfCert(api.PeerIdentityType(peerIdentity))
-			return c.idMapper.Verify(pkiID, signature, message)
-		}
-		err = m.Verify(receivedMsg.Identity, verifier)
-		if err != nil {
-			c.logger.Error("Failed verifying signature from", remoteAddress, ":", err)
-			return nil, err
-		}
-		connInfo.Auth = &proto.AuthInfo{
-			Signature:  m.Signature,
-			SignedData: m.Payload,
-		}
+	}
+	// Final step - verify the signature on the connection message itself
+	verifier := func(peerIdentity []byte, signature, message []byte) error {
+		pkiID := c.idMapper.GetPKIidOfCert(api.PeerIdentityType(peerIdentity))
+		return c.idMapper.Verify(pkiID, signature, message)
+	}
+	err = m.Verify(receivedMsg.Identity, verifier)
+	if err != nil {
+		c.logger.Errorf("Failed verifying signature from %s : %v", remoteAddress, err)
+		return nil, err
 	}
 
 	c.logger.Debug("Authenticated", remoteAddress)
@@ -492,11 +483,11 @@ func (c *commImpl) authenticateRemotePeer(stream stream) (*proto.ConnectionInfo,
 
 func (c *commImpl) GossipStream(stream proto.Gossip_GossipStreamServer) error {
 	if c.isStopping() {
-		return errors.New("Shutting down")
+		return fmt.Errorf("Shutting down")
 	}
 	connInfo, err := c.authenticateRemotePeer(stream)
 	if err != nil {
-		c.logger.Error("Authentication failed:", err)
+		c.logger.Errorf("Authentication failed: %v", err)
 		return err
 	}
 	c.logger.Debug("Servicing", extractRemoteAddress(stream))
@@ -564,16 +555,16 @@ func readWithTimeout(stream interface{}, timeout time.Duration, address string) 
 				incChan <- msg
 			}
 		} else {
-			panic(fmt.Errorf("Stream isn't a GossipStreamServer or a GossipStreamClient, but %v. Aborting", reflect.TypeOf(stream)))
+			panic(errors.Errorf("Stream isn't a GossipStreamServer or a GossipStreamClient, but %v. Aborting", reflect.TypeOf(stream)))
 		}
 	}()
 	select {
 	case <-time.NewTicker(timeout).C:
-		return nil, fmt.Errorf("Timed out waiting for connection message from %s", address)
+		return nil, errors.Errorf("Timed out waiting for connection message from %s", address)
 	case m := <-incChan:
 		return m, nil
 	case err := <-errChan:
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 }
 
@@ -593,7 +584,7 @@ func (c *commImpl) createConnectionMsg(pkiID common.PKIidType, certHash []byte, 
 		GossipMessage: m,
 	}
 	_, err := sMsg.Sign(signer)
-	return sMsg, err
+	return sMsg, errors.WithStack(err)
 }
 
 type stream interface {

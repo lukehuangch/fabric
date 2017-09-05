@@ -14,6 +14,7 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/Shopify/sarama/mocks"
 	mockconfig "github.com/hyperledger/fabric/common/mocks/config"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	mockblockcutter "github.com/hyperledger/fabric/orderer/mocks/common/blockcutter"
 	mockmultichannel "github.com/hyperledger/fabric/orderer/mocks/common/multichannel"
 	cb "github.com/hyperledger/fabric/protos/common"
@@ -338,6 +339,7 @@ func TestChain(t *testing.T) {
 		case <-time.After(shortTimeout):
 			t.Fatal("startChan should have been closed by now")
 		}
+		defer chain.Halt()
 
 		// Now make it so that the next ProduceRequest is met with an error
 		mockBroker.SetHandlerByMap(map[string]sarama.MockResponse{
@@ -659,8 +661,6 @@ func TestSendTimeToCut(t *testing.T) {
 }
 
 func TestProcessMessagesToBlocks(t *testing.T) {
-	subtestIndex := -1 // Used to calculate the right offset at each subtest
-
 	mockBroker := sarama.NewMockBroker(t, 0)
 	defer func() { mockBroker.Close() }()
 
@@ -676,16 +676,12 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	mockBrokerConfigCopy := *mockBrokerConfig
 	mockBrokerConfigCopy.ChannelBufferSize = 0
 
-	newestOffset := int64(0)
-
 	mockParentConsumer := mocks.NewConsumer(t, &mockBrokerConfigCopy)
-	mpc := mockParentConsumer.ExpectConsumePartition(mockChannel.topic(), mockChannel.partition(), newestOffset)
-	mockChannelConsumer, err := mockParentConsumer.ConsumePartition(mockChannel.topic(), mockChannel.partition(), newestOffset)
+	mpc := mockParentConsumer.ExpectConsumePartition(mockChannel.topic(), mockChannel.partition(), int64(0))
+	mockChannelConsumer, err := mockParentConsumer.ConsumePartition(mockChannel.topic(), mockChannel.partition(), int64(0))
 	assert.NoError(t, err, "Expected no error when setting up the mock partition consumer")
 
 	t.Run("ReceiveConnect", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -727,8 +723,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveRegularWithError", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -770,8 +764,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveRegularAndQueue", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -827,8 +819,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveRegularAndCutBlock", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -887,8 +877,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveTwoRegularAndCutTwoBlocks", func(t *testing.T) {
-		subtestIndex++
-
 		if testing.Short() {
 			t.Skip("Skipping test in short mode")
 		}
@@ -933,6 +921,7 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 		var block1, block2 *cb.Block
 
 		// This is the first wrappedMessage that the for-loop will process
+		block1LastOffset := mpc.HighWaterMarkOffset()
 		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
 		mockSupport.BlockCutterVal.Block <- struct{}{} // Let the `mockblockcutter.Ordered` call return
 		logger.Debugf("Mock blockcutter's Ordered call has returned")
@@ -940,6 +929,7 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 		mockSupport.BlockCutterVal.IsolatedTx = true
 
 		// This is the first wrappedMessage that the for-loop will process
+		block2LastOffset := mpc.HighWaterMarkOffset()
 		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
 		mockSupport.BlockCutterVal.Block <- struct{}{}
 		logger.Debugf("Mock blockcutter's Ordered call has returned for the second time")
@@ -961,19 +951,100 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 		logger.Debug("haltChan closed")
 		<-done
 
-		expectedOffset := newestOffset + int64(subtestIndex) // TODO Hacky, revise eventually
-
 		assert.NoError(t, err, "Expected the processMessagesToBlocks call to return without errors")
 		assert.Equal(t, uint64(2), counts[indexRecvPass], "Expected 2 messages received and unmarshaled")
 		assert.Equal(t, uint64(2), counts[indexProcessRegularPass], "Expected 2 REGULAR messages processed")
 		assert.Equal(t, lastCutBlockNumber+2, bareMinimumChain.lastCutBlockNumber, "Expected lastCutBlockNumber to be bumped up by two")
-		assert.Equal(t, expectedOffset+1, extractEncodedOffset(block1.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in first block to be %d", newestOffset+1)
-		assert.Equal(t, expectedOffset+2, extractEncodedOffset(block2.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in first block to be %d", newestOffset+2)
+		assert.Equal(t, block1LastOffset, extractEncodedOffset(block1.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in first block to be %d", block1LastOffset)
+		assert.Equal(t, block2LastOffset, extractEncodedOffset(block2.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in second block to be %d", block2LastOffset)
+	})
+
+	t.Run("SecondTxOverflows", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("Skipping test in short mode")
+		}
+
+		errorChan := make(chan struct{})
+		close(errorChan)
+		haltChan := make(chan struct{})
+
+		lastCutBlockNumber := uint64(3)
+
+		mockSupport := &mockmultichannel.ConsenterSupport{
+			Blocks:         make(chan *cb.Block), // WriteBlock will post here
+			BlockCutterVal: mockblockcutter.NewReceiver(),
+			ChainIDVal:     mockChannel.topic(),
+			HeightVal:      lastCutBlockNumber, // Incremented during the WriteBlock call
+			SharedConfigVal: &mockconfig.Orderer{
+				BatchTimeoutVal: longTimeout,
+			},
+		}
+		defer close(mockSupport.BlockCutterVal.Block)
+
+		bareMinimumChain := &chainImpl{
+			parentConsumer:  mockParentConsumer,
+			channelConsumer: mockChannelConsumer,
+
+			channel:            mockChannel,
+			support:            mockSupport,
+			lastCutBlockNumber: lastCutBlockNumber,
+
+			errorChan: errorChan,
+			haltChan:  haltChan,
+		}
+
+		var counts []uint64
+		done := make(chan struct{})
+
+		go func() {
+			counts, err = bareMinimumChain.processMessagesToBlocks()
+			done <- struct{}{}
+		}()
+
+		var block1, block2 *cb.Block
+
+		block1LastOffset := mpc.HighWaterMarkOffset()
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+		mockSupport.BlockCutterVal.Block <- struct{}{} // Let the `mockblockcutter.Ordered` call return
+
+		// Set CutAncestors to true so that second message overflows receiver batch
+		mockSupport.BlockCutterVal.CutAncestors = true
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+		mockSupport.BlockCutterVal.Block <- struct{}{}
+
+		select {
+		case block1 = <-mockSupport.Blocks: // Let the `mockConsenterSupport.WriteBlock` proceed
+		case <-time.After(shortTimeout):
+			logger.Fatalf("Did not receive a block from the blockcutter as expected")
+		}
+
+		// Set CutNext to true to flush all pending messages
+		mockSupport.BlockCutterVal.CutAncestors = false
+		mockSupport.BlockCutterVal.CutNext = true
+		block2LastOffset := mpc.HighWaterMarkOffset()
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+		mockSupport.BlockCutterVal.Block <- struct{}{}
+
+		select {
+		case block2 = <-mockSupport.Blocks:
+		case <-time.After(shortTimeout):
+			logger.Fatalf("Did not receive a block from the blockcutter as expected")
+		}
+
+		logger.Debug("Closing haltChan to exit the infinite for-loop")
+		close(haltChan) // Identical to chain.Halt()
+		logger.Debug("haltChan closed")
+		<-done
+
+		assert.NoError(t, err, "Expected the processMessagesToBlocks call to return without errors")
+		assert.Equal(t, uint64(3), counts[indexRecvPass], "Expected 2 messages received and unmarshaled")
+		assert.Equal(t, uint64(3), counts[indexProcessRegularPass], "Expected 2 REGULAR messages processed")
+		assert.Equal(t, lastCutBlockNumber+2, bareMinimumChain.lastCutBlockNumber, "Expected lastCutBlockNumber to be bumped up by two")
+		assert.Equal(t, block1LastOffset, extractEncodedOffset(block1.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in first block to be %d", block1LastOffset)
+		assert.Equal(t, block2LastOffset, extractEncodedOffset(block2.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in second block to be %d", block2LastOffset)
 	})
 
 	t.Run("ReceiveRegularAndSendTimeToCut", func(t *testing.T) {
-		subtestIndex++
-
 		t.Skip("Skipping test as it introduces a race condition")
 
 		// NB We haven't set a handlermap for the mock broker so we need to set
@@ -1048,8 +1119,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 		// - Consumer.Retry.Backoff
 		// - Metadata.Retry.Max
 
-		subtestIndex++
-
 		t.Skip("Skipping test as it introduces a race condition")
 
 		// Exact same test as ReceiveRegularAndSendTimeToCut.
@@ -1120,8 +1189,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveTimeToCutProper", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -1181,8 +1248,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveTimeToCutZeroBatch", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -1232,8 +1297,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveTimeToCutLargerThanExpected", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -1283,8 +1346,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveTimeToCutStale", func(t *testing.T) {
-		subtestIndex++
-
 		errorChan := make(chan struct{})
 		close(errorChan)
 		haltChan := make(chan struct{})
@@ -1334,8 +1395,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveKafkaErrorAndCloseErrorChan", func(t *testing.T) {
-		subtestIndex++
-
 		// If we set up the mock broker so that it returns a response, if the
 		// test finishes before the sendConnectMessage goroutine has received
 		// this response, we will get a failure ("not all expectations were
@@ -1400,8 +1459,6 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 	})
 
 	t.Run("ReceiveKafkaErrorAndThenReceiveRegularMessage", func(t *testing.T) {
-		subtestIndex++
-
 		t.Skip("Skipping test as it introduces a race condition")
 
 		// If we set up the mock broker so that it returns a response, if the
@@ -1484,5 +1541,136 @@ func TestProcessMessagesToBlocks(t *testing.T) {
 		close(haltChan) // Identical to chain.Halt()
 		logger.Debug("haltChan closed")
 		<-done
+	})
+
+	t.Run("ReceiveBadConfigEnvelope", func(t *testing.T) {
+		errorChan := make(chan struct{})
+		close(errorChan)
+		haltChan := make(chan struct{})
+
+		lastCutBlockNumber := uint64(3)
+
+		mockSupport := &mockmultichannel.ConsenterSupport{
+			Blocks:              make(chan *cb.Block), // WriteBlock will post here
+			BlockCutterVal:      mockblockcutter.NewReceiver(),
+			ChainIDVal:          mockChannel.topic(),
+			HeightVal:           lastCutBlockNumber, // Incremented during the WriteBlock call
+			ClassifyMsgVal:      msgprocessor.ConfigUpdateMsg,
+			ProcessNormalMsgErr: fmt.Errorf("Error processing config update"),
+			SharedConfigVal: &mockconfig.Orderer{
+				BatchTimeoutVal: longTimeout,
+			},
+		}
+		defer close(mockSupport.BlockCutterVal.Block)
+
+		bareMinimumChain := &chainImpl{
+			parentConsumer:  mockParentConsumer,
+			channelConsumer: mockChannelConsumer,
+
+			channel:            mockChannel,
+			support:            mockSupport,
+			lastCutBlockNumber: lastCutBlockNumber,
+
+			errorChan: errorChan,
+			haltChan:  haltChan,
+		}
+
+		var counts []uint64
+		done := make(chan struct{})
+
+		go func() {
+			counts, err = bareMinimumChain.processMessagesToBlocks()
+			done <- struct{}{}
+		}()
+
+		// This is the config wrappedMessage that the for-loop will process.
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+
+		logger.Debug("Closing haltChan to exit the infinite for-loop")
+		// We are guaranteed to hit the haltChan branch after hitting the REGULAR branch at least once
+		close(haltChan) // Identical to chain.Halt()
+		logger.Debug("haltChan closed")
+		<-done
+
+		assert.NoError(t, err, "Expected the processMessagesToBlocks call to return without errors")
+		assert.Equal(t, uint64(1), counts[indexRecvPass], "Expected 1 message received and unmarshaled")
+		assert.Equal(t, uint64(1), counts[indexProcessRegularPass], "Expected 1 REGULAR message processed")
+		assert.Equal(t, lastCutBlockNumber, bareMinimumChain.lastCutBlockNumber, "Expected lastCutBlockNumber not to be incremented")
+	})
+
+	t.Run("ReceiveConfigEnvelopeAndCut", func(t *testing.T) {
+		errorChan := make(chan struct{})
+		close(errorChan)
+		haltChan := make(chan struct{})
+
+		lastCutBlockNumber := uint64(3)
+
+		mockSupport := &mockmultichannel.ConsenterSupport{
+			Blocks:         make(chan *cb.Block), // WriteBlock will post here
+			BlockCutterVal: mockblockcutter.NewReceiver(),
+			ChainIDVal:     mockChannel.topic(),
+			HeightVal:      lastCutBlockNumber, // Incremented during the WriteBlock call
+			SharedConfigVal: &mockconfig.Orderer{
+				BatchTimeoutVal: longTimeout,
+			},
+		}
+		defer close(mockSupport.BlockCutterVal.Block)
+
+		bareMinimumChain := &chainImpl{
+			parentConsumer:  mockParentConsumer,
+			channelConsumer: mockChannelConsumer,
+
+			channel:            mockChannel,
+			support:            mockSupport,
+			lastCutBlockNumber: lastCutBlockNumber,
+
+			errorChan: errorChan,
+			haltChan:  haltChan,
+		}
+
+		var counts []uint64
+		done := make(chan struct{})
+
+		go func() {
+			counts, err = bareMinimumChain.processMessagesToBlocks()
+			done <- struct{}{}
+		}()
+
+		// This is the normal wrappedMessage that the for-loop will process
+		normalBlkOffset := mpc.HighWaterMarkOffset()
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+		mockSupport.BlockCutterVal.Block <- struct{}{} // Let the `mockblockcutter.Ordered` call return
+		logger.Debugf("Mock blockcutter's Ordered call has returned")
+
+		// This is the config wrappedMessage that the for-loop will process.
+		mockSupport.ClassifyMsgVal = msgprocessor.ConfigUpdateMsg
+		configBlkOffset := mpc.HighWaterMarkOffset()
+		mpc.YieldMessage(newMockConsumerMessage(newRegularMessage(utils.MarshalOrPanic(newMockEnvelope("fooMessage")))))
+
+		var normalBlk, configBlk *cb.Block
+		select {
+		case normalBlk = <-mockSupport.Blocks: // Let the `mockConsenterSupport.WriteBlock` proceed
+		case <-time.After(shortTimeout):
+			logger.Fatalf("Did not receive a block from the blockcutter as expected")
+		}
+
+		select {
+		case configBlk = <-mockSupport.Blocks:
+		case <-time.After(shortTimeout):
+			logger.Fatalf("Did not receive a block from the blockcutter as expected")
+		}
+
+		logger.Debug("Closing haltChan to exit the infinite for-loop")
+		// We are guaranteed to hit the haltChan branch after hitting the REGULAR branch at least once
+		close(haltChan) // Identical to chain.Halt()
+		logger.Debug("haltChan closed")
+		<-done
+
+		assert.NoError(t, err, "Expected the processMessagesToBlocks call to return without errors")
+		assert.Equal(t, uint64(2), counts[indexRecvPass], "Expected 1 message received and unmarshaled")
+		assert.Equal(t, uint64(2), counts[indexProcessRegularPass], "Expected 1 REGULAR message processed")
+		assert.Equal(t, lastCutBlockNumber+2, bareMinimumChain.lastCutBlockNumber, "Expected lastCutBlockNumber to be incremented by 2")
+		assert.Equal(t, normalBlkOffset, extractEncodedOffset(normalBlk.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in first block to be %d", normalBlkOffset)
+		assert.Equal(t, configBlkOffset, extractEncodedOffset(configBlk.GetMetadata().Metadata[cb.BlockMetadataIndex_ORDERER]), "Expected encoded offset in second block to be %d", configBlkOffset)
 	})
 }

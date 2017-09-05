@@ -1,23 +1,13 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package multichannel
 
 import (
-	"github.com/hyperledger/fabric/common/config"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	mockconfig "github.com/hyperledger/fabric/common/mocks/config"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
@@ -68,6 +58,9 @@ type ConsenterSupport struct {
 
 	// ProcessConfigUpdateMsgErr is returned as the error for ProcessConfigUpdateMsg
 	ProcessConfigUpdateMsgErr error
+
+	// SequenceVal is returned by Sequence
+	SequenceVal uint64
 }
 
 // BlockCutter returns BlockCutterVal
@@ -76,7 +69,7 @@ func (mcs *ConsenterSupport) BlockCutter() blockcutter.Receiver {
 }
 
 // SharedConfig returns SharedConfigVal
-func (mcs *ConsenterSupport) SharedConfig() config.Orderer {
+func (mcs *ConsenterSupport) SharedConfig() channelconfig.Orderer {
 	return mcs.SharedConfigVal
 }
 
@@ -93,18 +86,17 @@ func (mcs *ConsenterSupport) CreateNextBlock(data []*cb.Envelope) *cb.Block {
 }
 
 // WriteBlock writes data to the Blocks channel
-func (mcs *ConsenterSupport) WriteBlock(block *cb.Block, encodedMetadataValue []byte) *cb.Block {
+func (mcs *ConsenterSupport) WriteBlock(block *cb.Block, encodedMetadataValue []byte) {
 	if encodedMetadataValue != nil {
 		block.Metadata.Metadata[cb.BlockMetadataIndex_ORDERER] = utils.MarshalOrPanic(&cb.Metadata{Value: encodedMetadataValue})
 	}
 	mcs.HeightVal++
 	mcs.Blocks <- block
-	return block
 }
 
 // WriteConfigBlock calls WriteBlock
-func (mcs *ConsenterSupport) WriteConfigBlock(block *cb.Block, encodedMetadataValue []byte) *cb.Block {
-	return mcs.WriteBlock(block, encodedMetadataValue)
+func (mcs *ConsenterSupport) WriteConfigBlock(block *cb.Block, encodedMetadataValue []byte) {
+	mcs.WriteBlock(block, encodedMetadataValue)
 }
 
 // ChainID returns the chain ID this specific consenter instance is associated with
@@ -128,7 +120,7 @@ func (mcs *ConsenterSupport) NewSignatureHeader() (*cb.SignatureHeader, error) {
 }
 
 // ClassifyMsg returns ClassifyMsgVal, ClassifyMsgErr
-func (mcs *ConsenterSupport) ClassifyMsg(env *cb.Envelope) (msgprocessor.Classification, error) {
+func (mcs *ConsenterSupport) ClassifyMsg(chdr *cb.ChannelHeader) (msgprocessor.Classification, error) {
 	return mcs.ClassifyMsgVal, mcs.ClassifyMsgErr
 }
 
@@ -140,4 +132,9 @@ func (mcs *ConsenterSupport) ProcessNormalMsg(env *cb.Envelope) (configSeq uint6
 // ProcessConfigUpdateMsg returns ProcessConfigUpdateMsgVal, ConfigSeqVal, ProcessConfigUpdateMsgErr
 func (mcs *ConsenterSupport) ProcessConfigUpdateMsg(env *cb.Envelope) (config *cb.Envelope, configSeq uint64, err error) {
 	return mcs.ProcessConfigUpdateMsgVal, mcs.ConfigSeqVal, mcs.ProcessConfigUpdateMsgErr
+}
+
+// Sequence returns SequenceVal
+func (mcs *ConsenterSupport) Sequence() uint64 {
+	return mcs.SequenceVal
 }

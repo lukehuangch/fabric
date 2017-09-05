@@ -179,6 +179,7 @@ type msgInspection func(t *testing.T, index int, m *receivedMsg)
 
 func TestAnchorPeer(t *testing.T) {
 	t.Parallel()
+	defer testWG.Done()
 	// Actors:
 	// OrgA: {
 	// 	p:   a real gossip instance
@@ -262,7 +263,7 @@ func TestAnchorPeer(t *testing.T) {
 	p := newGossipInstanceWithExternalEndpoint(portPrefix, 0, cs, endpoint)
 	defer p.Stop()
 	p.JoinChan(jcm, channel)
-	p.UpdateChannelMetadata([]byte("bla"), channel)
+	p.UpdateChannelMetadata(createMetadata(1), channel)
 
 	time.Sleep(time.Second * 5)
 
@@ -281,6 +282,7 @@ func TestAnchorPeer(t *testing.T) {
 
 func TestBootstrapPeerMisConfiguration(t *testing.T) {
 	t.Parallel()
+	defer testWG.Done()
 	// Scenario:
 	// The peer 'p' is a peer in orgA
 	// Peers bs1 and bs2 are bootstrap peers.

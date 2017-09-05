@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/hyperledger/fabric/core/committer"
+	"github.com/hyperledger/fabric/core/common/privdata"
 	"github.com/hyperledger/fabric/core/deliverservice"
 	"github.com/hyperledger/fabric/core/deliverservice/blocksprovider"
 	"github.com/hyperledger/fabric/gossip/api"
@@ -18,10 +19,12 @@ import (
 	"github.com/hyperledger/fabric/gossip/gossip"
 	"github.com/hyperledger/fabric/gossip/identity"
 	"github.com/hyperledger/fabric/gossip/integration"
+	privdata2 "github.com/hyperledger/fabric/gossip/privdata"
 	"github.com/hyperledger/fabric/gossip/state"
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/hyperledger/fabric/protos/common"
 	proto "github.com/hyperledger/fabric/protos/gossip"
+	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 )
@@ -37,10 +40,13 @@ type gossipSvc gossip.Gossip
 type GossipService interface {
 	gossip.Gossip
 
+	// DistributePrivateData distributes private data to the peers in the collections
+	// according to policies induced by the PolicyStore and PolicyParser
+	DistributePrivateData(chainID string, txID string, privateData []byte, ps privdata.PolicyStore, pp privdata.PolicyParser) error
 	// NewConfigEventer creates a ConfigProcessor which the configtx.Manager can ultimately route config updates to
 	NewConfigEventer() ConfigProcessor
 	// InitializeChannel allocates the state provider and should be invoked once per channel per execution
-	InitializeChannel(chainID string, committer committer.Committer, endpoints []string)
+	InitializeChannel(chainID string, committer committer.Committer, store privdata2.TransientStore, endpoints []string)
 	// GetBlock returns block for given chain
 	GetBlock(chainID string, index uint64) *common.Block
 	// AddPayload appends message payload to for given chain
@@ -69,6 +75,7 @@ func (*deliveryFactoryImpl) Service(g GossipService, endpoints []string, mcs api
 
 type gossipServiceImpl struct {
 	gossipSvc
+	coordinators    map[string]privdata2.Coordinator
 	chains          map[string]state.GossipStateProvider
 	leaderElection  map[string]election.LeaderElectionService
 	deliveryService deliverclient.DeliverService
@@ -139,6 +146,7 @@ func InitGossipServiceCustomDeliveryFactory(peerIdentity []byte, endpoint string
 		gossipServiceInstance = &gossipServiceImpl{
 			mcs:             mcs,
 			gossipSvc:       gossip,
+			coordinators:    make(map[string]privdata2.Coordinator),
 			chains:          make(map[string]state.GossipStateProvider),
 			leaderElection:  make(map[string]election.LeaderElectionService),
 			deliveryFactory: factory,
@@ -147,12 +155,22 @@ func InitGossipServiceCustomDeliveryFactory(peerIdentity []byte, endpoint string
 			secAdv:          secAdv,
 		}
 	})
-	return err
+	return errors.WithStack(err)
 }
 
 // GetGossipService returns an instance of gossip service
 func GetGossipService() GossipService {
 	return gossipServiceInstance
+}
+
+func (g *gossipServiceImpl) DistributePrivateData(chainID string, txID string, privData []byte, ps privdata.PolicyStore, pp privdata.PolicyParser) error {
+	g.lock.RLock()
+	coord, exists := g.coordinators[chainID]
+	g.lock.RUnlock()
+	if !exists {
+		return errors.Errorf("No coordinator for %s", chainID)
+	}
+	return coord.Distribute(privData, txID, ps, pp)
 }
 
 // NewConfigEventer creates a ConfigProcessor which the configtx.Manager can ultimately route config updates to
@@ -161,17 +179,20 @@ func (g *gossipServiceImpl) NewConfigEventer() ConfigProcessor {
 }
 
 // InitializeChannel allocates the state provider and should be invoked once per channel per execution
-func (g *gossipServiceImpl) InitializeChannel(chainID string, committer committer.Committer, endpoints []string) {
+func (g *gossipServiceImpl) InitializeChannel(chainID string, committer committer.Committer, store privdata2.TransientStore, endpoints []string) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
 	// Initialize new state provider for given committer
 	logger.Debug("Creating state provider for chainID", chainID)
-	g.chains[chainID] = state.NewGossipStateProvider(chainID, g, committer, g.mcs)
+	servicesAdapater := &state.ServicesMediator{GossipAdapter: g, MCSAdapter: g.mcs}
+	coordinator := privdata2.NewCoordinator(committer, store)
+	g.coordinators[chainID] = coordinator
+	g.chains[chainID] = state.NewGossipStateProvider(chainID, servicesAdapater, coordinator)
 	if g.deliveryService == nil {
 		var err error
 		g.deliveryService, err = g.deliveryFactory.Service(gossipServiceInstance, endpoints, g.mcs)
 		if err != nil {
-			logger.Warning("Cannot create delivery client, due to", err)
+			logger.Warningf("Cannot create delivery client, due to %+v", errors.WithStack(err))
 		}
 	}
 
@@ -249,14 +270,15 @@ func (g *gossipServiceImpl) AddPayload(chainID string, payload *proto.Payload) e
 func (g *gossipServiceImpl) Stop() {
 	g.lock.Lock()
 	defer g.lock.Unlock()
-	for _, ch := range g.chains {
-		logger.Info("Stopping chain", ch)
-		ch.Stop()
-	}
 
-	for chainID, electionService := range g.leaderElection {
-		logger.Infof("Stopping leader election for %s", chainID)
-		electionService.Stop()
+	for chainID := range g.chains {
+		logger.Info("Stopping chain", chainID)
+		if le, exists := g.leaderElection[chainID]; exists {
+			logger.Infof("Stopping leader election for %s", chainID)
+			le.Stop()
+		}
+		g.chains[chainID].Stop()
+		g.coordinators[chainID].Close()
 	}
 	g.gossipSvc.Stop()
 	if g.deliveryService != nil {
@@ -290,12 +312,12 @@ func (g *gossipServiceImpl) onStatusChangeFactory(chainID string, committer bloc
 			}
 			logger.Info("Elected as a leader, starting delivery service for channel", chainID)
 			if err := g.deliveryService.StartDeliverForChannel(chainID, committer, yield); err != nil {
-				logger.Error("Delivery service is not able to start blocks delivery for chain, due to", err)
+				logger.Errorf("Delivery service is not able to start blocks delivery for chain, due to %+v", errors.WithStack(err))
 			}
 		} else {
 			logger.Info("Renounced leadership, stopping delivery service for channel", chainID)
 			if err := g.deliveryService.StopDeliverForChannel(chainID); err != nil {
-				logger.Error("Delivery service is not able to stop blocks delivery for chain, due to", err)
+				logger.Errorf("Delivery service is not able to stop blocks delivery for chain, due to %+v", errors.WithStack(err))
 			}
 
 		}

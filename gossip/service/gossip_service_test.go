@@ -14,15 +14,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/common/config"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/localmsp"
 	"github.com/hyperledger/fabric/core/deliverservice"
 	"github.com/hyperledger/fabric/core/deliverservice/blocksprovider"
+	"github.com/hyperledger/fabric/core/ledger"
+	"github.com/hyperledger/fabric/core/transientstore"
 	"github.com/hyperledger/fabric/gossip/api"
 	gossipCommon "github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/election"
 	"github.com/hyperledger/fabric/gossip/gossip"
 	"github.com/hyperledger/fabric/gossip/identity"
+	"github.com/hyperledger/fabric/gossip/privdata"
 	"github.com/hyperledger/fabric/gossip/state"
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/hyperledger/fabric/msp/mgmt"
@@ -38,6 +41,17 @@ import (
 
 func init() {
 	util.SetupTestLogging()
+}
+
+type mockTransientStore struct {
+}
+
+func (*mockTransientStore) Persist(txid string, endorserid string, endorsementBlkHt uint64, privateSimulationResults []byte) error {
+	panic("implement me")
+}
+
+func (*mockTransientStore) GetSelfSimulatedTxPvtRWSetByTxid(txid string) (*transientstore.EndorserPvtSimulationResults, error) {
+	panic("implement me")
 }
 
 func TestInitGossipService(t *testing.T) {
@@ -116,7 +130,7 @@ func TestLeaderElectionWithDeliverClient(t *testing.T) {
 		gossips[i].(*gossipServiceImpl).deliveryFactory = deliverServiceFactory
 		deliverServiceFactory.service.running[channelName] = false
 
-		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, []string{"localhost:5005"})
+		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, &mockTransientStore{}, []string{"localhost:5005"})
 		service, exist := gossips[i].(*gossipServiceImpl).leaderElection[channelName]
 		assert.True(t, exist, "Leader election service should be created for peer %d and channel %s", i, channelName)
 		services[i] = &electionService{nil, false, 0}
@@ -172,7 +186,7 @@ func TestWithStaticDeliverClientLeader(t *testing.T) {
 	for i := 0; i < n; i++ {
 		gossips[i].(*gossipServiceImpl).deliveryFactory = deliverServiceFactory
 		deliverServiceFactory.service.running[channelName] = false
-		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, []string{"localhost:5005"})
+		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, &mockTransientStore{}, []string{"localhost:5005"})
 	}
 
 	for i := 0; i < n; i++ {
@@ -183,7 +197,7 @@ func TestWithStaticDeliverClientLeader(t *testing.T) {
 	channelName = "chanB"
 	for i := 0; i < n; i++ {
 		deliverServiceFactory.service.running[channelName] = false
-		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, []string{"localhost:5005"})
+		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, &mockTransientStore{}, []string{"localhost:5005"})
 	}
 
 	for i := 0; i < n; i++ {
@@ -220,7 +234,7 @@ func TestWithStaticDeliverClientNotLeader(t *testing.T) {
 	for i := 0; i < n; i++ {
 		gossips[i].(*gossipServiceImpl).deliveryFactory = deliverServiceFactory
 		deliverServiceFactory.service.running[channelName] = false
-		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, []string{"localhost:5005"})
+		gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, &mockTransientStore{}, []string{"localhost:5005"})
 	}
 
 	for i := 0; i < n; i++ {
@@ -257,7 +271,7 @@ func TestWithStaticDeliverClientBothStaticAndLeaderElection(t *testing.T) {
 	for i := 0; i < n; i++ {
 		gossips[i].(*gossipServiceImpl).deliveryFactory = deliverServiceFactory
 		assert.Panics(t, func() {
-			gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, []string{"localhost:5005"})
+			gossips[i].InitializeChannel(channelName, &mockLedgerInfo{1}, &mockTransientStore{}, []string{"localhost:5005"})
 		}, "Dynamic leader lection based and static connection to ordering service can't exist simultaniosly")
 	}
 
@@ -291,6 +305,14 @@ func (ds *mockDeliverService) Stop() {
 
 type mockLedgerInfo struct {
 	Height uint64
+}
+
+func (li *mockLedgerInfo) CommitWithPvtData(blockAndPvtData *ledger.BlockAndPvtData) error {
+	panic("implement me")
+}
+
+func (li *mockLedgerInfo) GetPvtDataAndBlockByNum(seqNum uint64) (*ledger.BlockAndPvtData, error) {
+	panic("implement me")
 }
 
 // LedgerHeight returns mocked value to the ledger height
@@ -552,10 +574,11 @@ func addPeersToChannel(t *testing.T, n int, portPrefix int, channel string, peer
 
 	wg := sync.WaitGroup{}
 	for _, i := range peerIndexes {
+		metaBytes, _ := gossipCommon.NewNodeMetastate(0).Bytes()
 		wg.Add(1)
 		go func(i int) {
 			peers[i].JoinChan(jcm, gossipCommon.ChainID(channel))
-			peers[i].UpdateChannelMetadata([]byte("bla bla"), gossipCommon.ChainID(channel))
+			peers[i].UpdateChannelMetadata(metaBytes, gossipCommon.ChainID(channel))
 			wg.Done()
 		}(i)
 	}
@@ -609,6 +632,7 @@ func newGossipInstance(portPrefix int, id int, maxMsgCount int, boot ...int) Gos
 		gossipSvc:       gossip,
 		chains:          make(map[string]state.GossipStateProvider),
 		leaderElection:  make(map[string]election.LeaderElectionService),
+		coordinators:    make(map[string]privdata.Coordinator),
 		deliveryFactory: &deliveryFactoryImpl{},
 		idMapper:        idMapper,
 		peerIdentity:    api.PeerIdentityType(conf.InternalEndpoint),
@@ -732,7 +756,7 @@ func TestChannelConfig(t *testing.T) {
 
 	mc := &mockConfig{
 		sequence: 1,
-		orgs: map[string]config.ApplicationOrg{
+		orgs: map[string]channelconfig.ApplicationOrg{
 			string(orgInChannelA): &appGrp{
 				mspID:       string(orgInChannelA),
 				anchorPeers: []*peer.AnchorPeer{},

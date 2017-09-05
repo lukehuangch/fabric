@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hyperledger/fabric/common/configtx"
-	genesisconfig "github.com/hyperledger/fabric/common/configtx/tool/localconfig"
+	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/localmsp"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
 	"github.com/hyperledger/fabric/msp"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -110,7 +110,7 @@ func CreateChannel(server *BenchmarkServer) string {
 	defer client.Close()
 
 	channelID := RandomID(10)
-	createChannelTx, _ := configtx.MakeChainCreationTransaction(
+	createChannelTx, _ := channelconfig.MakeChainCreationTransaction(
 		channelID,
 		genesisconfig.SampleConsortiumName,
 		signer,
