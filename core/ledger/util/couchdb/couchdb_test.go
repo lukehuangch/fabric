@@ -29,6 +29,7 @@ import (
 	"github.com/hyperledger/fabric/common/ledger/testutil"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
 	ledgertestutil "github.com/hyperledger/fabric/core/ledger/testutil"
+	logging "github.com/op/go-logging"
 	"github.com/spf13/viper"
 )
 
@@ -82,6 +83,11 @@ func TestMain(m *testing.M) {
 	viper.Set("ledger.state.couchDBConfig.maxRetriesOnStartup", 10)
 	viper.Set("ledger.state.couchDBConfig.requestTimeout", time.Second*35)
 
+	//set the logging level to DEBUG to test debug only code
+	logging.SetLevel(logging.DEBUG, "couchdb")
+
+	viper.Set("logging.peer", "debug")
+
 	// Create CouchDB definition from config parameters
 	couchDBDef = GetCouchDBDefinition()
 
@@ -108,6 +114,25 @@ func TestDBBadConnectionDef(t *testing.T) {
 	_, err := CreateConnectionDefinition(badParseConnectURL, couchDBDef.Username, couchDBDef.Password,
 		couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
 	testutil.AssertError(t, err, fmt.Sprintf("Did not receive error when trying to create database connection definition with a bad hostname"))
+
+}
+
+func TestEncodePathElement(t *testing.T) {
+
+	encodedString := encodePathElement("testelement")
+	testutil.AssertEquals(t, encodedString, "testelement")
+
+	encodedString = encodePathElement("test element")
+	testutil.AssertEquals(t, encodedString, "test%20element")
+
+	encodedString = encodePathElement("/test element")
+	testutil.AssertEquals(t, encodedString, "%2Ftest%20element")
+
+	encodedString = encodePathElement("/test element:")
+	testutil.AssertEquals(t, encodedString, "%2Ftest%20element:")
+
+	encodedString = encodePathElement("/test+ element:")
+	testutil.AssertEquals(t, encodedString, "%2Ftest%2B%20element:")
 
 }
 
@@ -185,6 +210,18 @@ func TestBadCouchDBInstance(t *testing.T) {
 	//Test BatchUpdateDocuments with bad connection
 	_, err = badDB.BatchUpdateDocuments(nil)
 	testutil.AssertError(t, err, "Error should have been thrown with BatchUpdateDocuments and invalid connection")
+
+	//Test ListIndex with bad connection
+	_, err = badDB.ListIndex()
+	testutil.AssertError(t, err, "Error should have been thrown with ListIndex and invalid connection")
+
+	//Test CreateIndex with bad connection
+	err = badDB.CreateIndex("")
+	testutil.AssertError(t, err, "Error should have been thrown with CreateIndex and invalid connection")
+
+	//Test DeleteIndex with bad connection
+	err = badDB.DeleteIndex("", "")
+	testutil.AssertError(t, err, "Error should have been thrown with DeleteIndex and invalid connection")
 
 }
 
@@ -295,6 +332,27 @@ func TestDBBadConnection(t *testing.T) {
 			couchDBDef.MaxRetries, 3, couchDBDef.RequestTimeout)
 		testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for a bad connection"))
 	}
+}
+
+func TestBadDBCredentials(t *testing.T) {
+
+	if ledgerconfig.IsCouchDBEnabled() {
+
+		database := "testdbbadcredentials"
+		err := cleanup(database)
+		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to cleanup  Error: %s", err))
+		defer cleanup(database)
+
+		if err == nil {
+			//create a new instance and database object
+			_, err := CreateCouchInstance(couchDBDef.URL, "fred", "fred",
+				couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
+			testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for bad credentials"))
+
+		}
+
+	}
+
 }
 
 func TestDBCreateDatabaseAndPersist(t *testing.T) {
@@ -843,6 +901,163 @@ func TestCouchDBVersion(t *testing.T) {
 
 }
 
+func TestIndexOperations(t *testing.T) {
+
+	database := "testindexoperations"
+	err := cleanup(database)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to cleanup  Error: %s", err))
+	defer cleanup(database)
+
+	byteJSON1 := []byte(`{"_id":"1", "asset_name":"marble1","color":"blue","size":1,"owner":"jerry"}`)
+	byteJSON2 := []byte(`{"_id":"2", "asset_name":"marble2","color":"red","size":2,"owner":"tom"}`)
+	byteJSON3 := []byte(`{"_id":"3", "asset_name":"marble3","color":"green","size":3,"owner":"jerry"}`)
+	byteJSON4 := []byte(`{"_id":"4", "asset_name":"marble4","color":"purple","size":4,"owner":"tom"}`)
+	byteJSON5 := []byte(`{"_id":"5", "asset_name":"marble5","color":"blue","size":5,"owner":"jerry"}`)
+	byteJSON6 := []byte(`{"_id":"6", "asset_name":"marble6","color":"white","size":6,"owner":"tom"}`)
+	byteJSON7 := []byte(`{"_id":"7", "asset_name":"marble7","color":"white","size":7,"owner":"tom"}`)
+	byteJSON8 := []byte(`{"_id":"8", "asset_name":"marble8","color":"white","size":8,"owner":"tom"}`)
+	byteJSON9 := []byte(`{"_id":"9", "asset_name":"marble9","color":"white","size":9,"owner":"tom"}`)
+	byteJSON10 := []byte(`{"_id":"10", "asset_name":"marble10","color":"white","size":10,"owner":"tom"}`)
+
+	//create a new instance and database object   --------------------------------------------------------
+	couchInstance, err := CreateCouchInstance(couchDBDef.URL, couchDBDef.Username, couchDBDef.Password,
+		couchDBDef.MaxRetries, couchDBDef.MaxRetriesOnStartup, couchDBDef.RequestTimeout)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to create couch instance"))
+	db := CouchDatabase{CouchInstance: *couchInstance, DBName: database}
+
+	//create a new database
+	_, errdb := db.CreateDatabaseIfNotExist()
+	testutil.AssertNoError(t, errdb, fmt.Sprintf("Error when trying to create database"))
+
+	batchUpdateDocs := []*CouchDoc{}
+
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON1, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON2, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON3, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON4, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON5, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON6, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON7, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON8, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON9, Attachments: nil})
+	batchUpdateDocs = append(batchUpdateDocs, &CouchDoc{JSONValue: byteJSON10, Attachments: nil})
+
+	_, err = db.BatchUpdateDocuments(batchUpdateDocs)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error adding batch of documents"))
+
+	//Create an index definition
+	indexDefSize := "{\"index\":{\"fields\":[{\"size\":\"desc\"}]},\"ddoc\":\"indexSizeSortDoc\", \"name\":\"indexSizeSortName\",\"type\":\"json\"}"
+
+	//Create the index
+	err = db.CreateIndex(indexDefSize)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while creating an index"))
+
+	//Retrieve the list of indexes
+	//Delay for 100ms since CouchDB index list is updated async after index create/drop
+	time.Sleep(100 * time.Millisecond)
+	listResult, err := db.ListIndex()
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while retrieving indexes"))
+
+	//There should only be one item returned
+	testutil.AssertEquals(t, len(*listResult), 1)
+
+	//Verify the returned definition
+	for _, elem := range *listResult {
+		testutil.AssertEquals(t, elem.DesignDocument, "indexSizeSortDoc")
+		testutil.AssertEquals(t, elem.Name, "indexSizeSortName")
+		//ensure the index defintion is correct,  CouchDB 2.1.1 will also return "partial_filter_selector":{}
+		testutil.AssertEquals(t, strings.Contains(elem.Definition, `"fields":[{"size":"desc"}]`), true)
+	}
+
+	//Create an index definition with no DesignDocument or name
+	indexDefColor := "{\"index\":{\"fields\":[{\"color\":\"desc\"}]}}"
+
+	//Create the index
+	err = db.CreateIndex(indexDefColor)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while creating an index"))
+
+	//Retrieve the list of indexes
+	//Delay for 100ms since CouchDB index list is updated async after index create/drop
+	time.Sleep(100 * time.Millisecond)
+	listResult, err = db.ListIndex()
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while retrieving indexes"))
+
+	//There should be two indexes returned
+	testutil.AssertEquals(t, len(*listResult), 2)
+
+	//Delete the named index
+	err = db.DeleteIndex("indexSizeSortDoc", "indexSizeSortName")
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while deleting an index"))
+
+	//Retrieve the list of indexes
+	//Delay for 100ms since CouchDB index list is updated async after index create/drop
+	time.Sleep(100 * time.Millisecond)
+	listResult, err = db.ListIndex()
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while retrieving indexes"))
+
+	//There should be one index returned
+	testutil.AssertEquals(t, len(*listResult), 1)
+
+	//Delete the unnamed index
+	for _, elem := range *listResult {
+		err = db.DeleteIndex(elem.DesignDocument, string(elem.Name))
+		testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while deleting an index"))
+	}
+
+	//Retrieve the list of indexes
+	//Delay for 100ms since CouchDB index list is updated async after index create/drop
+	time.Sleep(100 * time.Millisecond)
+	listResult, err = db.ListIndex()
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while retrieving indexes"))
+	testutil.AssertEquals(t, len(*listResult), 0)
+
+	//Create a query string with a descending sort, this will require an index
+	queryString := "{\"selector\":{\"size\": {\"$gt\": 0}},\"fields\": [\"_id\", \"_rev\", \"owner\", \"asset_name\", \"color\", \"size\"], \"sort\":[{\"size\":\"desc\"}], \"limit\": 10,\"skip\": 0}"
+
+	//Execute a query with a sort, this should throw the exception
+	_, err = db.QueryDocuments(queryString)
+	testutil.AssertError(t, err, fmt.Sprintf("Error thrown while querying without a valid index"))
+
+	//Create the index
+	err = db.CreateIndex(indexDefSize)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while creating an index"))
+
+	//Execute a query with an index,  this should succeed
+	_, err = db.QueryDocuments(queryString)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while querying with an index"))
+
+	//Create another index definition
+	indexDefSize = "{\"index\":{\"fields\":[{\"data.size\":\"desc\"},{\"data.owner\":\"desc\"}]},\"ddoc\":\"indexSizeOwnerSortDoc\", \"name\":\"indexSizeOwnerSortName\",\"type\":\"json\"}"
+
+	//Create the index
+	err = db.CreateIndex(indexDefSize)
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while creating an index"))
+
+	//Retrieve the list of indexes
+	//Delay for 100ms since CouchDB index list is updated async after index create/drop
+	time.Sleep(100 * time.Millisecond)
+	listResult, err = db.ListIndex()
+	testutil.AssertNoError(t, err, fmt.Sprintf("Error thrown while retrieving indexes"))
+
+	//There should only be two definitions
+	testutil.AssertEquals(t, len(*listResult), 2)
+
+	//Create an invalid index definition with an invalid JSON
+	indexDefSize = "{\"index\"{\"fields\":[{\"data.size\":\"desc\"},{\"data.owner\":\"desc\"}]},\"ddoc\":\"indexSizeOwnerSortDoc\", \"name\":\"indexSizeOwnerSortName\",\"type\":\"json\"}"
+
+	//Create the index
+	err = db.CreateIndex(indexDefSize)
+	testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for an invalid index JSON"))
+
+	//Create an invalid index definition with a valid JSON and an invalid index definition
+	indexDefSize = "{\"index\":{\"fields2\":[{\"data.size\":\"desc\"},{\"data.owner\":\"desc\"}]},\"ddoc\":\"indexSizeOwnerSortDoc\", \"name\":\"indexSizeOwnerSortName\",\"type\":\"json\"}"
+
+	//Create the index
+	err = db.CreateIndex(indexDefSize)
+	testutil.AssertError(t, err, fmt.Sprintf("Error should have been thrown for an invalid index definition"))
+
+}
+
 func TestRichQuery(t *testing.T) {
 
 	if ledgerconfig.IsCouchDBEnabled() {
@@ -1130,6 +1345,7 @@ func TestBatchBatchOperations(t *testing.T) {
 		byteJSON03 := []byte(`{"_id":"marble03","asset_name":"marble03","color":"green","size":"3","owner":"jerry"}`)
 		byteJSON04 := []byte(`{"_id":"marble04","asset_name":"marble04","color":"purple","size":"4","owner":"tom"}`)
 		byteJSON05 := []byte(`{"_id":"marble05","asset_name":"marble05","color":"blue","size":"5","owner":"jerry"}`)
+		byteJSON06 := []byte(`{"_id":"marble06#$&'()*+,/:;=?@[]","asset_name":"marble06#$&'()*+,/:;=?@[]","color":"blue","size":"6","owner":"jerry"}`)
 
 		attachment1 := &AttachmentInfo{}
 		attachment1.AttachmentBytes = []byte(`marble01 - test attachment`)
@@ -1166,6 +1382,13 @@ func TestBatchBatchOperations(t *testing.T) {
 		attachments5 := []*AttachmentInfo{}
 		attachments5 = append(attachments5, attachment5)
 
+		attachment6 := &AttachmentInfo{}
+		attachment6.AttachmentBytes = []byte(`marble06#$&'()*+,/:;=?@[] - test attachment`)
+		attachment6.ContentType = "application/octet-stream"
+		attachment6.Name = "data"
+		attachments6 := []*AttachmentInfo{}
+		attachments6 = append(attachments6, attachment6)
+
 		database := "testbatch"
 		err := cleanup(database)
 		testutil.AssertNoError(t, err, fmt.Sprintf("Error when trying to cleanup  Error: %s", err))
@@ -1188,12 +1411,14 @@ func TestBatchBatchOperations(t *testing.T) {
 		value3 := &CouchDoc{JSONValue: byteJSON03, Attachments: attachments3}
 		value4 := &CouchDoc{JSONValue: byteJSON04, Attachments: attachments4}
 		value5 := &CouchDoc{JSONValue: byteJSON05, Attachments: attachments5}
+		value6 := &CouchDoc{JSONValue: byteJSON06, Attachments: attachments6}
 
 		batchUpdateDocs = append(batchUpdateDocs, value1)
 		batchUpdateDocs = append(batchUpdateDocs, value2)
 		batchUpdateDocs = append(batchUpdateDocs, value3)
 		batchUpdateDocs = append(batchUpdateDocs, value4)
 		batchUpdateDocs = append(batchUpdateDocs, value5)
+		batchUpdateDocs = append(batchUpdateDocs, value6)
 
 		batchUpdateResp, err := db.BatchUpdateDocuments(batchUpdateDocs)
 		testutil.AssertNoError(t, err, fmt.Sprintf("Error when attempting to update a batch of documents"))
@@ -1209,6 +1434,18 @@ func TestBatchBatchOperations(t *testing.T) {
 		testutil.AssertNoError(t, geterr, fmt.Sprintf("Error when attempting read a document"))
 
 		assetResp := &Asset{}
+		geterr = json.Unmarshal(dbGetResp.JSONValue, &assetResp)
+		testutil.AssertNoError(t, geterr, fmt.Sprintf("Error when trying to retrieve a document"))
+		//Verify the owner retrieved matches
+		testutil.AssertEquals(t, assetResp.Owner, "jerry")
+
+		//----------------------------------------------
+		// Test Retrieve JSON using ID with URL special characters,
+		// this will confirm that batch document IDs and URL IDs are consistent, even if they include special characters
+		dbGetResp, _, geterr = db.ReadDoc("marble06#$&'()*+,/:;=?@[]")
+		testutil.AssertNoError(t, geterr, fmt.Sprintf("Error when attempting read a document"))
+
+		assetResp = &Asset{}
 		geterr = json.Unmarshal(dbGetResp.JSONValue, &assetResp)
 		testutil.AssertNoError(t, geterr, fmt.Sprintf("Error when trying to retrieve a document"))
 		//Verify the owner retrieved matches

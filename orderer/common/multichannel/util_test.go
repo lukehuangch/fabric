@@ -11,7 +11,7 @@ import (
 
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
-	"github.com/hyperledger/fabric/common/tools/configtxgen/provisional"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
 	"github.com/hyperledger/fabric/orderer/consensus"
@@ -49,8 +49,12 @@ func (mch *mockChain) Order(env *cb.Envelope, configSeq uint64) error {
 	return nil
 }
 
-func (mch *mockChain) Configure(configUpdate, config *cb.Envelope, configSeq uint64) error {
+func (mch *mockChain) Configure(config *cb.Envelope, configSeq uint64) error {
 	mch.queue <- config
+	return nil
+}
+
+func (mch *mockChain) WaitReady() error {
 	return nil
 }
 
@@ -68,12 +72,9 @@ func (mch *mockChain) Start() {
 				logger.Panicf("If a message has arrived to this point, it should already have had header inspected once: %s", err)
 			}
 
-			class, err := mch.support.ClassifyMsg(chdr)
-			if err != nil {
-				logger.Panicf("If a message has arrived to this point, it should already have been classified once: %s", err)
-			}
+			class := mch.support.ClassifyMsg(chdr)
 			switch class {
-			case msgprocessor.ConfigUpdateMsg:
+			case msgprocessor.ConfigMsg:
 				batch := mch.support.BlockCutter().Cut()
 				if batch != nil {
 					block := mch.support.CreateNextBlock(batch)
@@ -93,6 +94,8 @@ func (mch *mockChain) Start() {
 					block := mch.support.CreateNextBlock(batch)
 					mch.support.WriteBlock(block, nil)
 				}
+			case msgprocessor.ConfigUpdateMsg:
+				logger.Panicf("Not expecting msg class ConfigUpdateMsg here")
 			default:
 				logger.Panicf("Unsupported msg classification: %v", class)
 			}
@@ -110,16 +113,15 @@ func makeConfigTx(chainID string, i int) *cb.Envelope {
 	group.Groups[channelconfig.OrdererGroupKey].Values[fmt.Sprintf("%d", i)] = &cb.ConfigValue{
 		Value: []byte(fmt.Sprintf("%d", i)),
 	}
-	configTemplate := configtx.NewSimpleTemplate(group)
-	configEnv, err := configTemplate.Envelope(chainID)
-	if err != nil {
-		panic(err)
-	}
-	return makeConfigTxFromConfigUpdateEnvelope(chainID, configEnv)
+	return makeConfigTxFromConfigUpdateEnvelope(chainID, &cb.ConfigUpdateEnvelope{
+		ConfigUpdate: utils.MarshalOrPanic(&cb.ConfigUpdate{
+			WriteSet: group,
+		}),
+	})
 }
 
 func wrapConfigTx(env *cb.Envelope) *cb.Envelope {
-	result, err := utils.CreateSignedEnvelope(cb.HeaderType_ORDERER_TRANSACTION, provisional.TestChainID, mockCrypto(), env, msgVersion, epoch)
+	result, err := utils.CreateSignedEnvelope(cb.HeaderType_ORDERER_TRANSACTION, genesisconfig.TestChainID, mockCrypto(), env, msgVersion, epoch)
 	if err != nil {
 		panic(err)
 	}

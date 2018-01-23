@@ -32,11 +32,11 @@ import (
 	"path/filepath"
 
 	bccsp "github.com/hyperledger/fabric/bccsp/factory"
-	"github.com/hyperledger/fabric/common/tools/configtxgen/provisional"
+	genesisconfig "github.com/hyperledger/fabric/common/tools/configtxgen/localconfig"
 )
 
 const (
-	pkgLogID = "orderer/common/localconfig"
+	pkgLogID = "orderer/common/config"
 
 	// Prefix identifies the prefix for the orderer-related ENV vars.
 	Prefix = "ORDERER"
@@ -50,7 +50,7 @@ var (
 
 func init() {
 	logger = flogging.MustGetLogger(pkgLogID)
-	flogging.SetModuleLevel(pkgLogID, "error")
+	flogging.SetModuleLevel(pkgLogID, "ERROR")
 
 	configName = strings.ToLower(Prefix)
 }
@@ -74,6 +74,7 @@ type General struct {
 	ListenAddress  string
 	ListenPort     uint16
 	TLS            TLS
+	Keepalive      Keepalive
 	GenesisMethod  string
 	GenesisProfile string
 	SystemChannel  string
@@ -84,9 +85,17 @@ type General struct {
 	LocalMSPDir    string
 	LocalMSPID     string
 	BCCSP          *bccsp.FactoryOpts
+	Authentication Authentication
 }
 
-// TLS contains config for TLS connections.
+// Keepalive contains configuration for gRPC servers
+type Keepalive struct {
+	ServerMinInterval time.Duration
+	ServerInterval    time.Duration
+	ServerTimeout     time.Duration
+}
+
+// TLS contains configuration for TLS connections.
 type TLS struct {
 	Enabled           bool
 	PrivateKey        string
@@ -94,6 +103,12 @@ type TLS struct {
 	RootCAs           []string
 	ClientAuthEnabled bool
 	ClientRootCAs     []string
+}
+
+// Authentication contains configuration parameters related to authenticating
+// client messages
+type Authentication struct {
+	TimeWindow time.Duration
 }
 
 // Profile contains configuration for Go pprof profiling.
@@ -177,7 +192,7 @@ var defaults = TopLevel{
 		ListenPort:     7050,
 		GenesisMethod:  "provisional",
 		GenesisProfile: "SampleSingleMSPSolo",
-		SystemChannel:  provisional.TestChainID,
+		SystemChannel:  genesisconfig.TestChainID,
 		GenesisFile:    "genesisblock",
 		Profile: Profile{
 			Enabled: false,
@@ -188,6 +203,9 @@ var defaults = TopLevel{
 		LocalMSPDir: "msp",
 		LocalMSPID:  "DEFAULT",
 		BCCSP:       bccsp.GetDefaultOpts(),
+		Authentication: Authentication{
+			TimeWindow: time.Duration(15 * time.Minute),
+		},
 	},
 	RAMLedger: RAMLedger{
 		HistorySize: 10000,
@@ -220,7 +238,7 @@ var defaults = TopLevel{
 			},
 		},
 		Verbose: false,
-		Version: sarama.V0_10_1_0,
+		Version: sarama.V0_10_2_0,
 		TLS: TLS{
 			Enabled: false,
 		},

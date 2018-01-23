@@ -50,6 +50,10 @@ func (mock *mockBlocksDelivererFactory) Create() (blocksprovider.BlocksDeliverer
 type mockMCS struct {
 }
 
+func (*mockMCS) Expiration(peerIdentity api.PeerIdentityType) (time.Time, error) {
+	return time.Now().Add(time.Hour), nil
+}
+
 func (*mockMCS) GetPKIidOfCert(peerIdentity api.PeerIdentityType) common.PKIidType {
 	return common.PKIidType("pkiID")
 }
@@ -239,6 +243,52 @@ func TestDeliverServiceFailover(t *testing.T) {
 	assertBlockDissemination(102, gossipServiceAdapter.GossipBlockDisseminations, t)
 	os.Shutdown()
 	service.Stop()
+}
+
+func TestDeliverServiceUpdateEndpoints(t *testing.T) {
+	// TODO: Add test case to check the endpoints update
+	// Case: Start service with given ordering service endpoint
+	// send a block, switch to new endpoint and send a new block
+	// Expected: Delivery service should be able to switch to
+	// updated endpoint and receive second block within timely manner.
+	defer ensureNoGoroutineLeak(t)()
+
+	os1 := mocks.NewOrderer(5612, t)
+
+	time.Sleep(time.Second)
+	gossipServiceAdapter := &mocks.MockGossipServiceAdapter{GossipBlockDisseminations: make(chan uint64)}
+
+	service, err := NewDeliverService(&Config{
+		Endpoints:   []string{"localhost:5612"},
+		Gossip:      gossipServiceAdapter,
+		CryptoSvc:   &mockMCS{},
+		ABCFactory:  DefaultABCFactory,
+		ConnFactory: DefaultConnectionFactory,
+	})
+	defer service.Stop()
+
+	assert.NoError(t, err)
+	li := &mocks.MockLedgerInfo{Height: uint64(100)}
+	os1.SetNextExpectedSeek(uint64(100))
+
+	err = service.StartDeliverForChannel("TEST_CHAINID", li, func() {})
+	assert.NoError(t, err, "can't start delivery")
+
+	go os1.SendBlock(uint64(100))
+	assertBlockDissemination(100, gossipServiceAdapter.GossipBlockDisseminations, t)
+
+	os2 := mocks.NewOrderer(5613, t)
+	defer os2.Shutdown()
+	os2.SetNextExpectedSeek(uint64(101))
+
+	service.UpdateEndpoints("TEST_CHAINID", []string{"localhost:5613"})
+	// Shutdown old ordering service to make sure block will now come from
+	// updated ordering service
+	os1.Shutdown()
+
+	atomic.StoreUint64(&li.Height, uint64(101))
+	go os2.SendBlock(uint64(101))
+	assertBlockDissemination(101, gossipServiceAdapter.GossipBlockDisseminations, t)
 }
 
 func TestDeliverServiceServiceUnavailable(t *testing.T) {

@@ -76,6 +76,9 @@ type GossipChannel interface {
 	// that are eligible to be in the channel
 	ConfigureChannel(joinMsg api.JoinChannelMessage)
 
+	// LeaveChannel makes the peer leave the channel
+	LeaveChannel()
+
 	// Stop stops the channel's activity
 	Stop()
 }
@@ -88,6 +91,9 @@ type Adapter interface {
 
 	// Gossip gossips a message in the channel
 	Gossip(message *proto.SignedGossipMessage)
+
+	// Forward sends a message to the next hops
+	Forward(message proto.ReceivedMessage)
 
 	// DeMultiplex de-multiplexes an item to subscribers
 	DeMultiplex(interface{})
@@ -134,6 +140,7 @@ type gossipChannel struct {
 	stateInfoRequestScheduler *time.Ticker
 	memFilter                 *membershipFilter
 	ledgerHeight              uint64
+	leftChannel               int32
 }
 
 type membershipFilter struct {
@@ -143,6 +150,9 @@ type membershipFilter struct {
 
 // GetMembership returns the known alive peers and their information
 func (mf *membershipFilter) GetMembership() []discovery.NetworkMember {
+	if mf.hasLeftChannel() {
+		return nil
+	}
 	var members []discovery.NetworkMember
 	for _, mem := range mf.adapter.GetMembership() {
 		if mf.eligibleForChannelAndSameOrg(mem) {
@@ -269,9 +279,21 @@ func (gc *gossipChannel) periodicalInvocation(fn func(), c <-chan time.Time) {
 	}
 }
 
+// LeaveChannel makes the peer leave the channel
+func (gc *gossipChannel) LeaveChannel() {
+	atomic.StoreInt32(&gc.leftChannel, 1)
+}
+
+func (gc *gossipChannel) hasLeftChannel() bool {
+	return atomic.LoadInt32(&gc.leftChannel) == 1
+}
+
 // GetPeers returns a list of peers with metadata as published by them
 func (gc *gossipChannel) GetPeers() []discovery.NetworkMember {
 	members := []discovery.NetworkMember{}
+	if gc.hasLeftChannel() {
+		return members
+	}
 
 	for _, member := range gc.GetMembership() {
 		if !gc.EligibleForChannel(member) {
@@ -281,7 +303,12 @@ func (gc *gossipChannel) GetPeers() []discovery.NetworkMember {
 		if stateInf == nil {
 			continue
 		}
+		props := stateInf.GetStateInfo().Properties
+		if props != nil && props.LeftChannel {
+			continue
+		}
 		member.Metadata = stateInf.GetStateInfo().Metadata
+		member.Properties = stateInf.GetStateInfo().Properties
 		members = append(members, member)
 	}
 	return members
@@ -452,7 +479,7 @@ func (gc *gossipChannel) ConfigureChannel(joinMsg api.JoinChannelMessage) {
 	}
 
 	if gc.joinMsg.SequenceNumber() > (joinMsg.SequenceNumber()) {
-		gc.logger.Warning("Already have a more updated JoinChannel message(", gc.joinMsg.SequenceNumber(), ") than", gc.joinMsg.SequenceNumber())
+		gc.logger.Warning("Already have a more updated JoinChannel message(", gc.joinMsg.SequenceNumber(), ") than", joinMsg.SequenceNumber())
 		return
 	}
 
@@ -517,7 +544,7 @@ func (gc *gossipChannel) HandleMessage(msg proto.ReceivedMessage) {
 
 		if added {
 			// Forward the message
-			gc.Gossip(msg.GetGossipMessage())
+			gc.Forward(msg)
 			// DeMultiplex to local subscribers
 			gc.DeMultiplex(m)
 
@@ -529,6 +556,10 @@ func (gc *gossipChannel) HandleMessage(msg proto.ReceivedMessage) {
 	}
 
 	if m.IsPullMsg() && m.GetPullMsgType() == proto.PullMsgType_BLOCK_MSG {
+		if gc.hasLeftChannel() {
+			gc.logger.Info("Received Pull message from", msg.GetConnectionInfo().Endpoint, "but left the channel", string(gc.chainID))
+			return
+		}
 		// If we don't have a StateInfo message from the peer,
 		// no way of validating its eligibility in the channel.
 		if gc.stateInfoMsgStore.MsgByID(msg.GetConnectionInfo().ID) == nil {
@@ -751,13 +782,8 @@ func (gc *gossipChannel) UpdateStateInfo(msg *proto.SignedGossipMessage) {
 	gc.Lock()
 	defer gc.Unlock()
 
-	nodeMeta, err := common.FromBytes(msg.GetStateInfo().Metadata)
-	if err != nil {
-		gc.logger.Warningf("Can't extract ledger height from metadata %+v", errors.WithStack(err))
-		return
-	}
 	gc.stateInfoMsgStore.Add(msg)
-	gc.ledgerHeight = nodeMeta.LedgerHeight
+	gc.ledgerHeight = msg.GetStateInfo().Properties.LedgerHeight
 	gc.stateInfoMsg = msg
 	atomic.StoreInt32(&gc.shouldGossipStateInfo, int32(1))
 }

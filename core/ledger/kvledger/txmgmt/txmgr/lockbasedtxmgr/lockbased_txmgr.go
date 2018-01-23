@@ -8,10 +8,11 @@ package lockbasedtxmgr
 import (
 	"sync"
 
+	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
+
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/privacyenabledstate"
-	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/validator"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/validator/valimpl"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
@@ -23,17 +24,19 @@ var logger = flogging.MustGetLogger("lockbasedtxmgr")
 // LockBasedTxMgr a simple implementation of interface `txmgmt.TxMgr`.
 // This implementation uses a read-write lock to prevent conflicts between transaction simulation and committing
 type LockBasedTxMgr struct {
-	db           privacyenabledstate.DB
-	validator    validator.Validator
-	batch        *privacyenabledstate.UpdateBatch
-	currentBlock *common.Block
-	commitRWLock sync.RWMutex
+	ledgerid       string
+	db             privacyenabledstate.DB
+	validator      validator.Validator
+	batch          *privacyenabledstate.UpdateBatch
+	currentBlock   *common.Block
+	stateListeners ledger.StateListeners
+	commitRWLock   sync.RWMutex
 }
 
 // NewLockBasedTxMgr constructs a new instance of NewLockBasedTxMgr
-func NewLockBasedTxMgr(db privacyenabledstate.DB) *LockBasedTxMgr {
+func NewLockBasedTxMgr(ledgerid string, db privacyenabledstate.DB, stateListeners ledger.StateListeners) *LockBasedTxMgr {
 	db.Open()
-	txmgr := &LockBasedTxMgr{db: db}
+	txmgr := &LockBasedTxMgr{ledgerid: ledgerid, db: db, stateListeners: stateListeners}
 	txmgr.validator = valimpl.NewStatebasedValidator(txmgr, db)
 	return txmgr
 }
@@ -73,7 +76,27 @@ func (txmgr *LockBasedTxMgr) ValidateAndPrepare(blockAndPvtdata *ledger.BlockAnd
 	}
 	txmgr.currentBlock = block
 	txmgr.batch = batch
-	return err
+	return txmgr.invokeNamespaceListeners(batch)
+}
+
+func (txmgr *LockBasedTxMgr) invokeNamespaceListeners(batch *privacyenabledstate.UpdateBatch) error {
+	namespaces := batch.PubUpdates.GetUpdatedNamespaces()
+	for _, namespace := range namespaces {
+		listerner := txmgr.stateListeners[namespace]
+		if listerner == nil {
+			continue
+		}
+		logger.Debugf("Invoking listener for state changes over namespace:%s", namespace)
+		updatesMap := batch.PubUpdates.GetUpdates(namespace)
+		var kvwrites []*kvrwset.KVWrite
+		for key, versionedValue := range updatesMap {
+			kvwrites = append(kvwrites, &kvrwset.KVWrite{Key: key, IsDelete: versionedValue.Value == nil, Value: versionedValue.Value})
+		}
+		if err := listerner.HandleStateUpdates(txmgr.ledgerid, kvwrites); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Shutdown implements method in interface `txmgmt.TxMgr`
@@ -116,10 +139,8 @@ func (txmgr *LockBasedTxMgr) Rollback() {
 
 // clearCache empty the cache maintained by the statedb implementation
 func (txmgr *LockBasedTxMgr) clearCache() {
-	commonStorageDB, _ := txmgr.db.(*privacyenabledstate.CommonStorageDB)
-	bulkOptimizable, ok := commonStorageDB.VersionedDB.(statedb.BulkOptimizable)
-	if ok {
-		bulkOptimizable.ClearCachedVersions()
+	if txmgr.db.IsBulkOptimizable() {
+		txmgr.db.ClearCachedVersions()
 	}
 }
 
@@ -143,8 +164,5 @@ func (txmgr *LockBasedTxMgr) CommitLostBlock(blockAndPvtdata *ledger.BlockAndPvt
 		return err
 	}
 	logger.Debugf("Committing block %d to state database", block.Header.Number)
-	if err := txmgr.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return txmgr.Commit()
 }

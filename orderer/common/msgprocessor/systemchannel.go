@@ -11,7 +11,6 @@ import (
 
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
-	configtxapi "github.com/hyperledger/fabric/common/configtx/api"
 	"github.com/hyperledger/fabric/common/crypto"
 	"github.com/hyperledger/fabric/common/policies"
 	cb "github.com/hyperledger/fabric/protos/common"
@@ -23,7 +22,7 @@ import (
 // ChannelConfigTemplator can be used to generate config templates.
 type ChannelConfigTemplator interface {
 	// NewChannelConfig creates a new template configuration manager.
-	NewChannelConfig(env *cb.Envelope) (configtxapi.Manager, error)
+	NewChannelConfig(env *cb.Envelope) (channelconfig.Resources, error)
 }
 
 // SystemChannel implements the Processor interface for the system channel.
@@ -49,8 +48,9 @@ func CreateSystemChannelFilters(chainCreator ChainCreator, ledgerResources chann
 	}
 	return NewRuleSet([]Rule{
 		EmptyRejectRule,
+		NewExpirationRejectRule(ledgerResources),
 		NewSizeFilter(ordererConfig),
-		NewSigFilter(policies.ChannelWriters, ledgerResources.PolicyManager()),
+		NewSigFilter(policies.ChannelWriters, ledgerResources),
 		NewSystemChannelFilter(ledgerResources, chainCreator),
 	})
 }
@@ -95,12 +95,12 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 
 	// If the channel ID does not match the system channel, then this must be a channel creation transaction
 
-	ctxm, err := s.templator.NewChannelConfig(envConfigUpdate)
+	bundle, err := s.templator.NewChannelConfig(envConfigUpdate)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	newChannelConfigEnv, err := ctxm.ProposeConfigUpdate(envConfigUpdate)
+	newChannelConfigEnv, err := bundle.ConfigtxValidator().ProposeConfigUpdate(envConfigUpdate)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -128,13 +128,68 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 	return wrappedOrdererTransaction, s.support.Sequence(), nil
 }
 
+// ProcessConfigMsg takes envelope of following two types:
+//   - `HeaderType_CONFIG`: system channel itself is the target of config, we simply unpack `ConfigUpdate`
+//     envelope from `LastUpdate` field and call `ProcessConfigUpdateMsg` on the underlying standard channel
+//   - `HeaderType_ORDERER_TRANSACTION`: it's a channel creation message, we unpack `ConfigUpdate` envelope
+//     and run `ProcessConfigUpdateMsg` on it
+func (s *SystemChannel) ProcessConfigMsg(env *cb.Envelope) (*cb.Envelope, uint64, error) {
+	payload, err := utils.UnmarshalPayload(env.Payload)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if payload.Header == nil {
+		return nil, 0, fmt.Errorf("Abort processing config msg because no head was set")
+	}
+
+	if payload.Header.ChannelHeader == nil {
+		return nil, 0, fmt.Errorf("Abort processing config msg because no channel header was set")
+	}
+
+	chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	if err != nil {
+		return nil, 0, fmt.Errorf("Abort processing config msg because channel header unmarshalling error: %s", err)
+	}
+
+	switch chdr.Type {
+	case int32(cb.HeaderType_CONFIG):
+		configEnvelope := &cb.ConfigEnvelope{}
+		if err = proto.Unmarshal(payload.Data, configEnvelope); err != nil {
+			return nil, 0, err
+		}
+
+		return s.StandardChannel.ProcessConfigUpdateMsg(configEnvelope.LastUpdate)
+
+	case int32(cb.HeaderType_ORDERER_TRANSACTION):
+		env, err := utils.UnmarshalEnvelope(payload.Data)
+		if err != nil {
+			return nil, 0, fmt.Errorf("Abort processing config msg because payload data unmarshalling error: %s", err)
+		}
+
+		configEnvelope := &cb.ConfigEnvelope{}
+		_, err = utils.UnmarshalEnvelopeOfType(env, cb.HeaderType_CONFIG, configEnvelope)
+		if err != nil {
+			return nil, 0, fmt.Errorf("Abort processing config msg because payload data unmarshalling error: %s", err)
+		}
+
+		return s.ProcessConfigUpdateMsg(configEnvelope.LastUpdate)
+
+	default:
+		return nil, 0, fmt.Errorf("Panic processing config msg due to unexpected envelope type %s", cb.HeaderType_name[chdr.Type])
+	}
+}
+
 // DefaultTemplatorSupport is the subset of the channel config required by the DefaultTemplator.
 type DefaultTemplatorSupport interface {
 	// ConsortiumsConfig returns the ordering system channel's Consortiums config.
 	ConsortiumsConfig() (channelconfig.Consortiums, bool)
 
-	// ConfigtxManager returns the configtx manager corresponding to the system channel's current config.
-	ConfigtxManager() configtxapi.Manager
+	// OrdererConfig returns the ordering configuration and whether the configuration exists
+	OrdererConfig() (channelconfig.Orderer, bool)
+
+	// ConfigtxValidator returns the configtx manager corresponding to the system channel's current config.
+	ConfigtxValidator() configtx.Validator
 
 	// Signer returns the local signer suitable for signing forwarded messages.
 	Signer() crypto.LocalSigner
@@ -153,7 +208,7 @@ func NewDefaultTemplator(support DefaultTemplatorSupport) *DefaultTemplator {
 }
 
 // NewChannelConfig creates a new template channel configuration based on the current config in the ordering system channel.
-func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (configtxapi.Manager, error) {
+func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (channelconfig.Resources, error) {
 	configUpdatePayload, err := utils.UnmarshalPayload(envConfigUpdate.Payload)
 	if err != nil {
 		return nil, fmt.Errorf("Failing initial channel config creation because of payload unmarshaling error: %s", err)
@@ -222,7 +277,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (conf
 	applicationGroup.ModPolicy = channelconfig.ChannelCreationPolicyKey
 
 	// Get the current system channel config
-	systemChannelGroup := dt.support.ConfigtxManager().ConfigEnvelope().Config.ChannelGroup
+	systemChannelGroup := dt.support.ConfigtxValidator().ConfigProto().ChannelGroup
 
 	// If the consortium group has no members, allow the source request to have no members.  However,
 	// if the consortium group has any members, there must be at least one member in the source request
@@ -261,7 +316,16 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (conf
 	// Set the new config orderer group to the system channel orderer group and the application group to the new application group
 	channelGroup.Groups[channelconfig.OrdererGroupKey] = systemChannelGroup.Groups[channelconfig.OrdererGroupKey]
 	channelGroup.Groups[channelconfig.ApplicationGroupKey] = applicationGroup
-	channelGroup.Values[channelconfig.ConsortiumKey] = channelconfig.TemplateConsortium(consortium.Name).Values[channelconfig.ConsortiumKey]
+	channelGroup.Values[channelconfig.ConsortiumKey] = &cb.ConfigValue{
+		Value:     utils.MarshalOrPanic(channelconfig.ConsortiumValue(consortium.Name).Value()),
+		ModPolicy: channelconfig.AdminsPolicyKey,
+	}
+
+	// Non-backwards compatible bugfix introduced in v1.1
+	// The capability check should be removed once v1.0 is deprecated
+	if oc, ok := dt.support.OrdererConfig(); ok && oc.Capabilities().SetChannelModPolicyDuringCreate() {
+		channelGroup.ModPolicy = systemChannelGroup.ModPolicy
+	}
 
 	bundle, err := channelconfig.NewBundle(channelHeader.ChannelId, &cb.Config{
 		ChannelGroup: channelGroup,
@@ -271,5 +335,5 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (conf
 		return nil, err
 	}
 
-	return bundle.ConfigtxManager(), nil
+	return bundle, nil
 }

@@ -18,12 +18,16 @@ package lockbasedtxmgr
 
 import (
 	"errors"
+	"fmt"
+
+	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/txmgr"
 
 	commonledger "github.com/hyperledger/fabric/common/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
+	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/hyperledger/fabric/protos/ledger/queryresult"
 	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
 )
@@ -98,11 +102,26 @@ func (h *queryHelper) getPrivateData(ns, coll, key string) ([]byte, error) {
 	if err := h.checkDone(); err != nil {
 		return nil, err
 	}
-	versionedValue, err := h.txmgr.db.GetPrivateData(ns, coll, key)
-	if err != nil {
+
+	var err error
+	var hashVersion *version.Height
+	var versionedValue *statedb.VersionedValue
+
+	if versionedValue, err = h.txmgr.db.GetPrivateData(ns, coll, key); err != nil {
 		return nil, err
 	}
+
 	val, ver := decomposeVersionedValue(versionedValue)
+
+	keyHash := util.ComputeStringHash(key)
+	if hashVersion, err = h.txmgr.db.GetKeyHashVersion(ns, coll, keyHash); err != nil {
+		return nil, err
+	}
+	if !version.AreSame(hashVersion, ver) {
+		return nil, &txmgr.ErrPvtdataNotAvailable{Msg: fmt.Sprintf(
+			"Private data matching public hash version is not available. Public hash version = %#v, Private data version = %#v",
+			hashVersion, ver)}
+	}
 	if h.rwsetBuilder != nil {
 		h.rwsetBuilder.AddToHashedReadSet(ns, coll, key, ver)
 	}
@@ -129,13 +148,25 @@ func (h *queryHelper) getPrivateDataMultipleKeys(ns, coll string, keys []string)
 }
 
 func (h *queryHelper) getPrivateDataRangeScanIterator(namespace, collection, startKey, endKey string) (commonledger.ResultsIterator, error) {
-	// TODO
-	return nil, errors.New("Not Yet Supported")
+	if err := h.checkDone(); err != nil {
+		return nil, err
+	}
+	dbItr, err := h.txmgr.db.GetPrivateDataRangeScanIterator(namespace, collection, startKey, endKey)
+	if err != nil {
+		return nil, err
+	}
+	return &pvtdataResultsItr{namespace, collection, dbItr}, nil
 }
 
 func (h *queryHelper) executeQueryOnPrivateData(namespace, collection, query string) (commonledger.ResultsIterator, error) {
-	// TODO
-	return nil, errors.New("Not Yet Supported")
+	if err := h.checkDone(); err != nil {
+		return nil, err
+	}
+	dbItr, err := h.txmgr.db.ExecuteQueryOnPrivateData(namespace, collection, query)
+	if err != nil {
+		return nil, err
+	}
+	return &pvtdataResultsItr{namespace, collection, dbItr}, nil
 }
 
 func (h *queryHelper) done() {
@@ -297,4 +328,33 @@ func decomposeVersionedValue(versionedValue *statedb.VersionedValue) ([]byte, *v
 		ver = versionedValue.Version
 	}
 	return value, ver
+}
+
+// pvtdataResultsItr iterates over results of a query on pvt data
+type pvtdataResultsItr struct {
+	ns    string
+	coll  string
+	dbItr statedb.ResultsIterator
+}
+
+// Next implements method in interface ledger.ResultsIterator
+func (itr *pvtdataResultsItr) Next() (commonledger.QueryResult, error) {
+	queryResult, err := itr.dbItr.Next()
+	if err != nil {
+		return nil, err
+	}
+	if queryResult == nil {
+		return nil, nil
+	}
+	versionedQueryRecord := queryResult.(*statedb.VersionedKV)
+	return &queryresult.KV{
+		Namespace: itr.ns,
+		Key:       versionedQueryRecord.Key,
+		Value:     versionedQueryRecord.Value,
+	}, nil
+}
+
+// Close implements method in interface ledger.ResultsIterator
+func (itr *pvtdataResultsItr) Close() {
+	itr.dbItr.Close()
 }

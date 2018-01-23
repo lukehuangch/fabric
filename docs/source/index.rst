@@ -44,6 +44,7 @@ Business:
    blockchain
    capabilities
    fabric_model
+   ledger
    usecases
 
 .. toctree::
@@ -52,9 +53,11 @@ Business:
 
    build_network
    write_first_app
+   channel_update
    chaincode
    chaincode4ade
    chaincode4noah
+   systemchaincode
    videos
 
 .. toctree::
@@ -70,6 +73,7 @@ Business:
    endorsement-policies
    error-handling
    logging-control
+   peer-commands
 
 .. toctree::
    :maxdepth: 2
@@ -81,7 +85,7 @@ Business:
    fabric-sdks
    kafka
    channels
-   ledger
+   couchdb_as_state_database
    readwrite
    gossip
 

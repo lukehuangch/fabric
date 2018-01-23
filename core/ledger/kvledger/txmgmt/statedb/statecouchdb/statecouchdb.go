@@ -6,16 +6,21 @@ SPDX-License-Identifier: Apache-2.0
 package statecouchdb
 
 import (
+	"archive/tar"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
 	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
@@ -25,14 +30,17 @@ import (
 
 var logger = flogging.MustGetLogger("statecouchdb")
 
-var compositeKeySep = []byte{0x00}
-var lastKeyIndicator = byte(0x01)
-
 var binaryWrapper = "valueBytes"
 
 // querySkip is implemented for future use by query paging
 // currently defaulted to 0 and is not used
 var querySkip = 0
+
+//BatchableDocument defines a document for a batch
+type BatchableDocument struct {
+	CouchDoc couchdb.CouchDoc
+	Deleted  bool
+}
 
 // VersionedDBProvider implements interface VersionedDBProvider
 type VersionedDBProvider struct {
@@ -64,8 +72,71 @@ func NewVersionedDBProvider() (*VersionedDBProvider, error) {
 	return &VersionedDBProvider{couchInstance, make(map[string]*VersionedDB), sync.Mutex{}, 0}, nil
 }
 
+//HandleChaincodeDeploy initializes database artifacts for the database associated with the namespace
+func (vdb *VersionedDB) HandleChaincodeDeploy(chaincodeDefinition *cceventmgmt.ChaincodeDefinition, dbArtifactsTar []byte) error {
+
+	logger.Debugf("Entering HandleChaincodeDeploy")
+
+	if chaincodeDefinition == nil {
+		return fmt.Errorf("chaincodeDefinition must not be nil")
+	}
+
+	db, err := vdb.getNamespaceDBHandle(chaincodeDefinition.Name)
+	if err != nil {
+		return err
+	}
+
+	//initialize a reader for the artifacts tar file
+	artifactReader := bytes.NewReader(dbArtifactsTar)
+	tarReader := tar.NewReader(artifactReader)
+
+	for {
+
+		//read the next header from the tar
+		tarHeader, err := tarReader.Next()
+
+		//if the EOF is detected, then exit
+		if err == io.EOF {
+			// end of tar archive
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		logger.Debugf("Reading artifact from file: %s", tarHeader.Name)
+
+		//Ensure that this is not a directory
+		if !tarHeader.FileInfo().IsDir() {
+
+			//split the filename into directory and file name
+			dir, file := filepath.Split(tarHeader.Name)
+
+			if dir == "META-INF/statedb/couchdb/indexes/" {
+
+				logger.Debugf("Creating index from file file: %s", file)
+
+				//read the tar entry into a byte array
+				indexData, err := ioutil.ReadAll(tarReader)
+				if err != nil {
+					return err
+				}
+
+				//create the index from the tar entry
+				err = db.CreateIndex(string(indexData))
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // GetDBHandle gets the handle to a named database
 func (provider *VersionedDBProvider) GetDBHandle(dbName string) (statedb.VersionedDB, error) {
+
 	provider.mux.Lock()
 	defer provider.mux.Unlock()
 
@@ -88,24 +159,60 @@ func (provider *VersionedDBProvider) Close() {
 
 // VersionedDB implements VersionedDB interface
 type VersionedDB struct {
-	db                 *couchdb.CouchDatabase
-	dbName             string
+	couchInstance *couchdb.CouchInstance
+	metadataDB    *couchdb.CouchDatabase            // A database per channel to store metadata such as savepoint.
+	chainName     string                            // The name of the chain/channel.
+	namespaceDBs  map[string]*couchdb.CouchDatabase // One database per deployed chaincode.
+	//TODO: Decide whether to split committedDataCache into multiple cahces, i.e., one per namespace.
 	committedDataCache *CommittedVersions // Used as a local cache during bulk processing of a block.
+	mux                sync.RWMutex
 }
 
 // newVersionedDB constructs an instance of VersionedDB
 func newVersionedDB(couchInstance *couchdb.CouchInstance, dbName string) (*VersionedDB, error) {
 	// CreateCouchDatabase creates a CouchDB database object, as well as the underlying database if it does not exist
-	db, err := couchdb.CreateCouchDatabase(*couchInstance, dbName)
+	chainName := dbName
+
+	dbName = couchdb.ConstructMetadataDBName(dbName)
+
+	metadataDB, err := couchdb.CreateCouchDatabase(*couchInstance, dbName)
 	if err != nil {
 		return nil, err
 	}
 	versionMap := make(map[statedb.CompositeKey]*version.Height)
 	revMap := make(map[statedb.CompositeKey]string)
+	namespaceDBMap := make(map[string]*couchdb.CouchDatabase)
 
 	committedDataCache := &CommittedVersions{committedVersions: versionMap, revisionNumbers: revMap}
 
-	return &VersionedDB{db, dbName, committedDataCache}, nil
+	return &VersionedDB{couchInstance, metadataDB, chainName, namespaceDBMap, committedDataCache, sync.RWMutex{}}, nil
+}
+
+// getNamespaceDBHandle gets the handle to a named chaincode database
+func (vdb *VersionedDB) getNamespaceDBHandle(namespace string) (*couchdb.CouchDatabase, error) {
+
+	vdb.mux.RLock()
+	db := vdb.namespaceDBs[namespace]
+	vdb.mux.RUnlock()
+
+	if db != nil {
+		return db, nil
+	}
+
+	namespaceDBName := couchdb.ConstructNamespaceDBName(vdb.chainName, namespace)
+
+	vdb.mux.Lock()
+	defer vdb.mux.Unlock()
+	db = vdb.namespaceDBs[namespace]
+	if db == nil {
+		var err error
+		db, err = couchdb.CreateCouchDatabase(*vdb.couchInstance, namespaceDBName)
+		if err != nil {
+			return nil, err
+		}
+		vdb.namespaceDBs[namespace] = db
+	}
+	return db, nil
 }
 
 // Open implements method in VersionedDB interface
@@ -136,9 +243,11 @@ func (vdb *VersionedDB) BytesKeySuppoted() bool {
 func (vdb *VersionedDB) GetState(namespace string, key string) (*statedb.VersionedValue, error) {
 	logger.Debugf("GetState(). ns=%s, key=%s", namespace, key)
 
-	compositeKey := constructCompositeKey(namespace, key)
-
-	couchDoc, _, err := vdb.db.ReadDoc(string(compositeKey))
+	db, err := vdb.getNamespaceDBHandle(namespace)
+	if err != nil {
+		return nil, err
+	}
+	couchDoc, _, err := db.ReadDoc(key)
 	if err != nil {
 		return nil, err
 	}
@@ -152,21 +261,38 @@ func (vdb *VersionedDB) GetState(namespace string, key string) (*statedb.Version
 	return &statedb.VersionedValue{Value: returnValue, Version: returnVersion}, nil
 }
 
-// GetVersion implements method in VersionedDB interface
-func (vdb *VersionedDB) GetVersion(namespace string, key string) (*version.Height, error) {
+//GetCachedVersion implements method in VersionedDB interface
+func (vdb *VersionedDB) GetCachedVersion(namespace string, key string) (*version.Height, bool) {
+
+	logger.Debugf("Retrieving cached version: %s~%s", key, namespace)
 
 	compositeKey := statedb.CompositeKey{Namespace: namespace, Key: key}
 
 	// Retrieve the version from committed data cache.
 	// Since the cache was populated based on block readsets,
 	// checks during validation should find the version here
-	returnVersion, keyFound := vdb.committedDataCache.committedVersions[compositeKey]
+	version, keyFound := vdb.committedDataCache.committedVersions[compositeKey]
+
+	if !keyFound {
+		return nil, false
+	}
+	return version, true
+}
+
+// GetVersion implements method in VersionedDB interface
+func (vdb *VersionedDB) GetVersion(namespace string, key string) (*version.Height, error) {
+
+	returnVersion, keyFound := vdb.GetCachedVersion(namespace, key)
 
 	// If the version was not found in the committed data cache, retrieve it from statedb.
 	if !keyFound {
 
-		couchDBCompositeKey := constructCompositeKey(namespace, key)
-		couchDoc, _, err := vdb.db.ReadDoc(string(couchDBCompositeKey))
+		db, err := vdb.getNamespaceDBHandle(namespace)
+		if err != nil {
+			return nil, err
+		}
+		couchDoc, _, err := db.ReadDoc(key)
+
 		if err != nil {
 			return nil, err
 		}
@@ -195,9 +321,6 @@ func removeDataWrapper(wrappedValue []byte, attachments []*couchdb.AttachmentInf
 	// initialize the return value
 	returnValue := []byte{}
 
-	// initialize a default return version
-	returnVersion := version.NewHeight(0, 0)
-
 	// create a generic map for the json
 	jsonResult := make(map[string]interface{})
 
@@ -223,7 +346,7 @@ func removeDataWrapper(wrappedValue []byte, attachments []*couchdb.AttachmentInf
 
 	}
 
-	returnVersion = createVersionHeightFromVersionString(jsonResult["version"].(string))
+	returnVersion := createVersionHeightFromVersionString(jsonResult["version"].(string))
 
 	return returnValue, returnVersion
 
@@ -252,12 +375,12 @@ func (vdb *VersionedDB) GetStateRangeScanIterator(namespace string, startKey str
 	// Get the querylimit from core.yaml
 	queryLimit := ledgerconfig.GetQueryLimit()
 
-	compositeStartKey := constructCompositeKey(namespace, startKey)
-	compositeEndKey := constructCompositeKey(namespace, endKey)
-	if endKey == "" {
-		compositeEndKey[len(compositeEndKey)-1] = lastKeyIndicator
+	db, err := vdb.getNamespaceDBHandle(namespace)
+	if err != nil {
+		return nil, err
 	}
-	queryResult, err := vdb.db.ReadDocRange(string(compositeStartKey), string(compositeEndKey), queryLimit, querySkip)
+
+	queryResult, err := db.ReadDocRange(startKey, endKey, queryLimit, querySkip)
 	if err != nil {
 		logger.Debugf("Error calling ReadDocRange(): %s\n", err.Error())
 		return nil, err
@@ -273,71 +396,155 @@ func (vdb *VersionedDB) ExecuteQuery(namespace, query string) (statedb.ResultsIt
 	// Get the querylimit from core.yaml
 	queryLimit := ledgerconfig.GetQueryLimit()
 
-	queryString, err := ApplyQueryWrapper(namespace, query, queryLimit, 0)
+	queryString, err := ApplyQueryWrapper(query, queryLimit, 0)
 	if err != nil {
 		logger.Debugf("Error calling ApplyQueryWrapper(): %s\n", err.Error())
 		return nil, err
 	}
 
-	queryResult, err := vdb.db.QueryDocuments(queryString)
+	db, err := vdb.getNamespaceDBHandle(namespace)
+	if err != nil {
+		return nil, err
+	}
+	queryResult, err := db.QueryDocuments(queryString)
 	if err != nil {
 		logger.Debugf("Error calling QueryDocuments(): %s\n", err.Error())
 		return nil, err
 	}
+
 	logger.Debugf("Exiting ExecuteQuery")
-	return newQueryScanner(*queryResult), nil
+	return newQueryScanner(namespace, *queryResult), nil
 }
 
 // ApplyUpdates implements method in VersionedDB interface
 func (vdb *VersionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version.Height) error {
 
 	// STEP 1: GATHER DOCUMENT REVISION NUMBERS REQUIRED FOR THE COUCHDB BULK UPDATE
+	//         ALSO BUILD PROCESS BATCHES OF UPDATE DOCUMENTS BASED ON THE MAX BATCH SIZE
 
 	// initialize a missing key list
-	missingKeys := []*statedb.CompositeKey{}
+	var missingKeys []*statedb.CompositeKey
 
-	// Revision numbers are needed for couchdb updates.
-	// vdb.committedDataCache.revisionNumbers is a cache of revision numbers based on ID
-	// Document IDs and revision numbers will already be in the cache for read/writes,
-	// but will be missing in the case of blind writes.
-	// If the key is missing in the cache, then add the key to missingKeys
-	// A bulk read will then add the missing revisions to the cache
+	//initialize a processBatch for updating bulk documents
+	processBatch := statedb.NewUpdateBatch()
+
+	//get the max size of the batch from core.yaml
+	maxBatchSize := ledgerconfig.GetMaxBatchUpdateSize()
+
+	//initialize a counter to track the batch size
+	batchSizeCounter := 0
+
+	// Iterate through the batch passed in and create process batches
+	// using the max batch size
 	namespaces := batch.GetUpdatedNamespaces()
 	for _, ns := range namespaces {
+		// TODO: Need to run the following code block in a goroutine so that each chaincode batch
+		// can be processed and committed parallely.
 		nsUpdates := batch.GetUpdates(ns)
-		for k := range nsUpdates {
+		for k, vv := range nsUpdates {
+
+			//increment the batch size counter
+			batchSizeCounter++
+
 			compositeKey := statedb.CompositeKey{Namespace: ns, Key: k}
 
-			// check the cache to see if the key is missing
+			// Revision numbers are needed for couchdb updates.
+			// vdb.committedDataCache.revisionNumbers is a cache of revision numbers based on ID
+			// Document IDs and revision numbers will already be in the cache for read/writes,
+			// but will be missing in the case of blind writes.
+			// If the key is missing in the cache, then add the key to missingKeys
 			_, keyFound := vdb.committedDataCache.revisionNumbers[compositeKey]
 
 			if !keyFound {
 				// Add the key to the missing key list
+				// As there can be no duplicates in UpdateBatch, no need check for duplicates.
 				missingKeys = append(missingKeys, &compositeKey)
 			}
+
+			//add the record to the process batch
+			if vv.Value == nil {
+				processBatch.Delete(ns, k, vv.Version)
+			} else {
+				processBatch.Put(ns, k, vv.Value, vv.Version)
+			}
+
+			//Check to see if the process batch exceeds the max batch size
+			if batchSizeCounter >= maxBatchSize {
+
+				//STEP 2:  PROCESS EACH BATCH OF UPDATE DOCUMENTS
+
+				err := vdb.processUpdateBatch(processBatch, missingKeys)
+				if err != nil {
+					return err
+				}
+
+				//reset the batch size counter
+				batchSizeCounter = 0
+
+				//create a new process batch
+				processBatch = statedb.NewUpdateBatch()
+
+				// reset the missing key list
+				missingKeys = []*statedb.CompositeKey{}
+			}
 		}
+
+		//STEP 3:  PROCESS ANY REMAINING DOCUMENTS
+		err := vdb.processUpdateBatch(processBatch, missingKeys)
+		if err != nil {
+			return err
+		}
+
+		//reset the batch size counter
+		batchSizeCounter = 0
+
+		//create a new process batch
+		processBatch = statedb.NewUpdateBatch()
+
+		// reset the missing key list
+		missingKeys = []*statedb.CompositeKey{}
 	}
 
-	// if there are missing keys, add them to the committed data cache
+	// Record a savepoint at a given height
+	err := vdb.recordSavepoint(height, namespaces)
+	if err != nil {
+		logger.Errorf("Error during recordSavepoint: %s\n", err.Error())
+		return err
+	}
+
+	return nil
+}
+
+//ProcessUpdateBatch updates a batch
+func (vdb *VersionedDB) processUpdateBatch(updateBatch *statedb.UpdateBatch, missingKeys []*statedb.CompositeKey) error {
+
+	// An array of missing keys is passed in to the batch processing
+	// A bulk read will then add the missing revisions to the cache
 	if len(missingKeys) > 0 {
 
 		if logger.IsEnabledFor(logging.DEBUG) {
 			logger.Debugf("Retrieving keys with unknown revision numbers, keys= %s", printCompositeKeys(missingKeys))
 		}
 
-		vdb.LoadCommittedVersions(missingKeys)
+		err := vdb.LoadCommittedVersions(missingKeys)
+		if err != nil {
+			return err
+		}
 	}
 
-	// STEP 2: CREATE COUCHDB DOCS FROM UPDATE SET THEN DO A BULK UPDATE IN COUCHDB
+	// STEP 1: CREATE COUCHDB DOCS FROM UPDATE SET THEN DO A BULK UPDATE IN COUCHDB
 
 	// Use the batchUpdateMap for tracking couchdb updates by ID
 	// this will be used in case there are retries required
-	batchUpdateMap := make(map[string]interface{})
+	batchUpdateMap := make(map[string]*BatchableDocument)
 
+	//TODO: processUpdateBatch is called with updateBatch of a single namespace/chaincode at a time.
+	// Hence, retrieving namespaces from updateBatch and looping over it is not required. Need to remove
+	// only the outer for loop.
+	namespaces := updateBatch.GetUpdatedNamespaces()
 	for _, ns := range namespaces {
-		nsUpdates := batch.GetUpdates(ns)
-		for k, vv := range nsUpdates {
-			compositeKey := constructCompositeKey(ns, k)
+		nsUpdates := updateBatch.GetUpdates(ns)
+		for key, vv := range nsUpdates {
 
 			// Create a document structure
 			couchDoc := &couchdb.CouchDoc{}
@@ -345,25 +552,26 @@ func (vdb *VersionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 			// retrieve the couchdb revision from the cache
 			// Documents that do not exist in couchdb will not have revision numbers and will
 			// exist in the cache with a revision value of nil
-			revision := vdb.committedDataCache.revisionNumbers[statedb.CompositeKey{Namespace: ns, Key: k}]
+			revision := vdb.committedDataCache.revisionNumbers[statedb.CompositeKey{Namespace: ns, Key: key}]
 
 			var isDelete bool // initialized to false
 			if vv.Value == nil {
 				isDelete = true
 			}
 
-			logger.Debugf("Channel [%s]: key(string)=[%s] key(bytes)=[%#v], prior revision=[%s], isDelete=[%t]",
-				vdb.dbName, string(compositeKey), compositeKey, revision, isDelete)
+			logger.Debugf("Channel [%s]: namespace=[%s] key=[%#v], prior revision=[%s], isDelete=[%t]",
+				vdb.chainName, ns, key, revision, isDelete)
 
 			if isDelete {
 				// this is a deleted record.  Set the _deleted property to true
-				couchDoc.JSONValue = createCouchdbDocJSON(string(compositeKey), revision, nil, ns, vv.Version, true)
+				//couchDoc.JSONValue = createCouchdbDocJSON(string(compositeKey), revision, nil, ns, vv.Version, true)
+				couchDoc.JSONValue = createCouchdbDocJSON(key, revision, nil, vv.Version, true)
 
 			} else {
 
 				if couchdb.IsJSON(string(vv.Value)) {
 					// Handle as json
-					couchDoc.JSONValue = createCouchdbDocJSON(string(compositeKey), revision, vv.Value, ns, vv.Version, false)
+					couchDoc.JSONValue = createCouchdbDocJSON(key, revision, vv.Value, vv.Version, false)
 
 				} else { // if value is not json, handle as a couchdb attachment
 
@@ -374,64 +582,95 @@ func (vdb *VersionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 					attachments := append([]*couchdb.AttachmentInfo{}, attachment)
 
 					couchDoc.Attachments = attachments
-					couchDoc.JSONValue = createCouchdbDocJSON(string(compositeKey), revision, nil, ns, vv.Version, false)
+					couchDoc.JSONValue = createCouchdbDocJSON(key, revision, nil, vv.Version, false)
 
 				}
 			}
 
-			// Add the current docment to the update map
-			batchUpdateMap[string(compositeKey)] = couchDoc
+			// Add the current docment, revision and delete flag to the update map
+			batchUpdateMap[key] = &BatchableDocument{CouchDoc: *couchDoc, Deleted: isDelete}
 
 		}
-	}
 
-	if len(batchUpdateMap) > 0 {
+		//TODO: Run the following in a goroutine so that commit on each namespaceDB can happen parallely
+		if len(batchUpdateMap) > 0 {
 
-		batchUpdateDocs := []*couchdb.CouchDoc{}
-		for _, updateDocument := range batchUpdateMap {
-			batchUpdateDocs = append(batchUpdateDocs, updateDocument.(*couchdb.CouchDoc))
-		}
+			//Add the documents to the batch update array
+			batchUpdateDocs := []*couchdb.CouchDoc{}
+			for _, updateDocument := range batchUpdateMap {
+				batchUpdateDocument := updateDocument
+				batchUpdateDocs = append(batchUpdateDocs, &batchUpdateDocument.CouchDoc)
+			}
 
-		// Do the bulk update into couchdb
-		// Note that this will do retries if the entire bulk update fails or times out
-		batchUpdateResp, err := vdb.db.BatchUpdateDocuments(batchUpdateDocs)
-		if err != nil {
-			return err
-		}
+			// Do the bulk update into couchdb
+			// Note that this will do retries if the entire bulk update fails or times out
 
-		// STEP 3: IF INDIVIDUAL DOCUMENTS IN THE BULK UPDATE DID NOT SUCCEED, TRY THEM INDIVIDUALLY
+			db, err := vdb.getNamespaceDBHandle(ns)
+			if err != nil {
+				return err
+			}
+			batchUpdateResp, err := db.BatchUpdateDocuments(batchUpdateDocs)
+			if err != nil {
+				return err
+			}
 
-		// iterate through the response from CouchDB by document
-		for _, respDoc := range batchUpdateResp {
+			// STEP 2: IF INDIVIDUAL DOCUMENTS IN THE BULK UPDATE DID NOT SUCCEED, TRY THEM INDIVIDUALLY
 
-			// If the document returned an error, retry the individual document
-			if respDoc.Ok != true {
+			// iterate through the response from CouchDB by document
+			for _, respDoc := range batchUpdateResp {
 
-				// Save the individual document to couchdb
-				// Note that this will do retries as needed
-				_, err := vdb.db.SaveDoc(respDoc.ID, "", batchUpdateMap[respDoc.ID].(*couchdb.CouchDoc))
+				// If the document returned an error, retry the individual document
+				if respDoc.Ok != true {
 
-				// If the single document update with retries returns an error, then throw the error
-				if err != nil {
+					batchUpdateDocument := batchUpdateMap[respDoc.ID]
 
-					errorString := fmt.Sprintf("Error occurred while saving document ID = %v  Error: %s  Reason: %s\n",
-						respDoc.ID, respDoc.Error, respDoc.Reason)
+					var err error
 
-					logger.Errorf(errorString)
-					return fmt.Errorf(errorString)
+					//Remove the "_rev" from the JSON before saving
+					//this will allow the CouchDB retry logic to retry revisions without encountering
+					//a mismatch between the "If-Match" and the "_rev" tag in the JSON
+					if batchUpdateDocument.CouchDoc.JSONValue != nil {
+						err = removeJSONRevision(&batchUpdateDocument.CouchDoc.JSONValue)
+						if err != nil {
+							return err
+						}
+					}
+
+					// Check to see if the document was added to the batch as a delete type document
+					if batchUpdateDocument.Deleted {
+
+						//Log the warning message that a retry is being attempted for batch delete issue
+						logger.Warningf("CouchDB batch document delete encountered an problem. Retrying delete for document ID:%s", respDoc.ID)
+
+						// If this is a deleted document, then retry the delete
+						// If the delete fails due to a document not being found (404 error),
+						// the document has already been deleted and the DeleteDoc will not return an error
+						err = db.DeleteDoc(respDoc.ID, "")
+					} else {
+
+						//Log the warning message that a retry is being attempted for batch update issue
+						logger.Warningf("CouchDB batch document update encountered an problem. Retrying update for document ID:%s", respDoc.ID)
+
+						// Save the individual document to couchdb
+						// Note that this will do retries as needed
+						_, err = db.SaveDoc(respDoc.ID, "", &batchUpdateDocument.CouchDoc)
+					}
+
+					// If the single document update or delete returns an error, then throw the error
+					if err != nil {
+
+						errorString := fmt.Sprintf("Error occurred while saving document ID = %v  Error: %s  Reason: %s\n",
+							respDoc.ID, respDoc.Error, respDoc.Reason)
+
+						logger.Errorf(errorString)
+						return fmt.Errorf(errorString)
+
+					}
 				}
 			}
+
 		}
 
-	}
-
-	// STEP 4: IF THERE WAS SUCCESS UPDATING COUCHDB, THEN RECORD A SAVEPOINT FOR THIS BLOCK HEIGHT
-
-	// Record a savepoint at a given height
-	err := vdb.recordSavepoint(height)
-	if err != nil {
-		logger.Errorf("Error during recordSavepoint: %s\n", err.Error())
-		return err
 	}
 
 	return nil
@@ -439,11 +678,11 @@ func (vdb *VersionedDB) ApplyUpdates(batch *statedb.UpdateBatch, height *version
 
 // printCompositeKeys is a convenience method to print readable log entries for arrays of pointers
 // to composite keys
-func printCompositeKeys(keyPointers []*statedb.CompositeKey) string {
+func printCompositeKeys(keys []*statedb.CompositeKey) string {
 
 	compositeKeyString := []string{}
-	for _, keyPointer := range keyPointers {
-		compositeKeyString = append(compositeKeyString, "["+keyPointer.Namespace+","+keyPointer.Key+"]")
+	for _, key := range keys {
+		compositeKeyString = append(compositeKeyString, "["+key.Namespace+","+key.Key+"]")
 	}
 	return strings.Join(compositeKeyString, ",")
 }
@@ -452,40 +691,115 @@ func printCompositeKeys(keyPointers []*statedb.CompositeKey) string {
 // A bulk retrieve from couchdb is used to populate the cache.
 // committedVersions cache will be used for state validation of readsets
 // revisionNumbers cache will be used during commit phase for couchdb bulk updates
-func (vdb *VersionedDB) LoadCommittedVersions(keys []*statedb.CompositeKey) {
+func (vdb *VersionedDB) LoadCommittedVersions(keys []*statedb.CompositeKey) error {
 
 	// initialize version and revision maps
 	versionMap := vdb.committedDataCache.committedVersions
 	revMap := vdb.committedDataCache.revisionNumbers
 
-	keysToRetrieve := []string{}
+	missingKeys := make(map[string][]string) // for each namespace/chaincode, store the missingKeys
+
 	for _, key := range keys {
 
-		// create composite key for couchdb
-		compositeDBKey := constructCompositeKey(key.Namespace, key.Key)
-		// add the composite key to the list of required keys
-		keysToRetrieve = append(keysToRetrieve, string(compositeDBKey))
+		logger.Debugf("Load into version cache: %s~%s", key.Key, key.Namespace)
 
+		// create the compositeKey
 		compositeKey := statedb.CompositeKey{Namespace: key.Namespace, Key: key.Key}
 
+		// initialize an entry for each key.  Set the version to nil
+		_, versionFound := versionMap[compositeKey]
+		if !versionFound {
+			versionMap[compositeKey] = nil
+		}
+
 		// initialize empty values for each key (revision numbers will not be in couchdb for new creates)
-		versionMap[compositeKey] = nil
-		revMap[compositeKey] = ""
+		_, revFound := revMap[compositeKey]
+		if !revFound {
+			revMap[compositeKey] = ""
+		}
+
+		// if the compositeKey was not found in the revision or version part of the cache, then add the key to the
+		// list of keys to be retrieved
+		if !revFound || !versionFound {
+			// add the missing key to the list of required keys
+			missingKeys[key.Namespace] = append(missingKeys[key.Namespace], key.Key)
+		}
 
 	}
 
-	documentMetadataArray, _ := vdb.db.BatchRetrieveDocumentMetadata(keysToRetrieve)
+	//get the max size of the batch from core.yaml
+	maxBatchSize := ledgerconfig.GetMaxBatchUpdateSize()
+
+	// Call the batch retrieve if there is one or more keys to retrieve
+	if len(missingKeys) > 0 {
+
+		for namespace := range missingKeys {
+			// TODO: For each namespace, we need to parallely load missing keys into the cache
+			// The following codes need be moved to goroutine and introduce RWlock for cache.
+
+			// Initialize the array of keys to be retrieved
+			keysToRetrieve := []string{}
+
+			// Iterate through the missingKeys and build a batch of keys for batch retrieval
+			for _, key := range missingKeys[namespace] {
+
+				keysToRetrieve = append(keysToRetrieve, key)
+
+				// check to see if the number of keys is greater than the max batch size
+				if len(keysToRetrieve) >= maxBatchSize {
+					err := vdb.batchRetrieveMetaData(namespace, keysToRetrieve)
+					if err != nil {
+						return err
+					}
+					// reset the array
+					keysToRetrieve = []string{}
+				}
+
+			}
+
+			// If there are any remaining, retrieve the final batch
+			if len(keysToRetrieve) > 0 {
+				err := vdb.batchRetrieveMetaData(namespace, keysToRetrieve)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+	}
+
+	return nil
+}
+
+// batchRetrieveMetaData retrieves a batch of keys and loads metadata into cache
+func (vdb *VersionedDB) batchRetrieveMetaData(namespace string, keys []string) error {
+
+	versionMap := vdb.committedDataCache.committedVersions
+	revMap := vdb.committedDataCache.revisionNumbers
+
+	db, err := vdb.getNamespaceDBHandle(namespace)
+	if err != nil {
+		return err
+	}
+
+	documentMetadataArray, err := db.BatchRetrieveDocumentMetadata(keys)
+
+	if err != nil {
+		logger.Errorf("Batch retrieval of document metadata failed %s\n", err.Error())
+		return err
+	}
 
 	for _, documentMetadata := range documentMetadataArray {
 
 		if len(documentMetadata.Version) != 0 {
-			ns, key := splitCompositeKey([]byte(documentMetadata.ID))
-			compositeKey := statedb.CompositeKey{Namespace: ns, Key: key}
+			compositeKey := statedb.CompositeKey{Namespace: namespace, Key: documentMetadata.ID}
 
 			versionMap[compositeKey] = createVersionHeightFromVersionString(documentMetadata.Version)
 			revMap[compositeKey] = documentMetadata.Rev
 		}
 	}
+
+	return nil
 }
 
 func createVersionHeightFromVersionString(encodedVersion string) *version.Height {
@@ -518,11 +832,10 @@ func (vdb *VersionedDB) ClearCachedVersions() {
 // _id - couchdb document ID, need for all couchdb batch operations
 // _rev - couchdb document revision, needed for updating or deleting existing documents
 // _deleted - flag using in batch operations for deleting a couchdb document
-// chaincodeID - chain code ID, added to header, used to scope couchdb queries
 // version - version, added to header, used for state validation
 // data wrapper - JSON from the chaincode goes here
 // The return value is the CouchDoc.JSONValue with the header fields populated
-func createCouchdbDocJSON(id, revision string, value []byte, chaincodeID string, version *version.Height, deleted bool) []byte {
+func createCouchdbDocJSON(id, revision string, value []byte, version *version.Height, deleted bool) []byte {
 
 	// create a version mapping
 	jsonMap := map[string]interface{}{"version": fmt.Sprintf("%v:%v", version.BlockNum, version.TxNum)}
@@ -541,9 +854,6 @@ func createCouchdbDocJSON(id, revision string, value []byte, chaincodeID string,
 
 	} else {
 
-		// add the chaincodeID
-		jsonMap["chaincodeid"] = chaincodeID
-
 		// Add the wrapped data if the value is not null
 		if value != nil {
 
@@ -560,41 +870,68 @@ func createCouchdbDocJSON(id, revision string, value []byte, chaincodeID string,
 	return documentJSON
 }
 
+// removeJSONRevision removes the "_rev" if this is a JSON
+func removeJSONRevision(jsonValue *[]byte) error {
+
+	jsonMap := make(map[string]interface{})
+
+	//Unmarshal the value into a map
+	err := json.Unmarshal(*jsonValue, &jsonMap)
+	if err != nil {
+		logger.Errorf("Failed to unmarshal couchdb JSON data %s\n", err.Error())
+		return err
+	}
+
+	//delete the "_rev" entry
+	delete(jsonMap, "_rev")
+
+	//marshal the updated map back into the byte array
+	*jsonValue, err = json.Marshal(jsonMap)
+	if err != nil {
+		logger.Errorf("Failed to marshal couchdb JSON data %s\n", err.Error())
+		return err
+	}
+
+	return nil
+
+}
+
 // Savepoint docid (key) for couchdb
 const savepointDocID = "statedb_savepoint"
 
 // Savepoint data for couchdb
 type couchSavepointData struct {
-	BlockNum  uint64 `json:"BlockNum"`
-	TxNum     uint64 `json:"TxNum"`
-	UpdateSeq string `json:"UpdateSeq"`
+	BlockNum uint64 `json:"BlockNum"`
+	TxNum    uint64 `json:"TxNum"`
 }
 
 // recordSavepoint Record a savepoint in statedb.
 // Couch parallelizes writes in cluster or sharded setup and ordering is not guaranteed.
-// Hence we need to fence the savepoint with sync. So ensure_full_commit is called before
-// savepoint to ensure all block writes are flushed. Savepoint itself does not need to be flushed,
-// it will get flushed with next block if not yet committed.
-func (vdb *VersionedDB) recordSavepoint(height *version.Height) error {
+// Hence we need to fence the savepoint with sync. So ensure_full_commit on all updated
+// namespace DBs is called before savepoint to ensure all block writes are flushed. Savepoint
+// itself is flushed to the metadataDB.
+func (vdb *VersionedDB) recordSavepoint(height *version.Height, namespaces []string) error {
 	var err error
 	var savepointDoc couchSavepointData
-	// ensure full commit to flush all changes until now to disk
-	dbResponse, err := vdb.db.EnsureFullCommit()
-	if err != nil || dbResponse.Ok != true {
-		logger.Errorf("Failed to perform full commit\n")
-		return errors.New("Failed to perform full commit")
+	// ensure full commit to flush all changes on updated namespaces until now to disk
+	// namespace also includes empty namespace which is nothing but metadataDB
+	for _, ns := range namespaces {
+		// TODO: Ensure full commit can be parallelized to improve performance
+		db, err := vdb.getNamespaceDBHandle(ns)
+		if err != nil {
+			return err
+		}
+		dbResponse, err := db.EnsureFullCommit()
+
+		if err != nil || dbResponse.Ok != true {
+			logger.Errorf("Failed to perform full commit\n")
+			return errors.New("Failed to perform full commit")
+		}
 	}
 
 	// construct savepoint document
-	// UpdateSeq would be useful if we want to get all db changes since a logical savepoint
-	dbInfo, _, err := vdb.db.GetDatabaseInfo()
-	if err != nil {
-		logger.Errorf("Failed to get DB info %s\n", err.Error())
-		return err
-	}
 	savepointDoc.BlockNum = height.BlockNum
 	savepointDoc.TxNum = height.TxNum
-	savepointDoc.UpdateSeq = dbInfo.UpdateSeq
 
 	savepointDocJSON, err := json.Marshal(savepointDoc)
 	if err != nil {
@@ -603,11 +940,16 @@ func (vdb *VersionedDB) recordSavepoint(height *version.Height) error {
 	}
 
 	// SaveDoc using couchdb client and use JSON format
-	_, err = vdb.db.SaveDoc(savepointDocID, "", &couchdb.CouchDoc{JSONValue: savepointDocJSON, Attachments: nil})
+	_, err = vdb.metadataDB.SaveDoc(savepointDocID, "", &couchdb.CouchDoc{JSONValue: savepointDocJSON, Attachments: nil})
 	if err != nil {
 		logger.Errorf("Failed to save the savepoint to DB %s\n", err.Error())
 		return err
 	}
+
+	// Note: Ensure full commit on metadataDB after storing the savepoint is not necessary
+	// as CouchDB syncs states to disk periodically (every 1 second). If peer fails before
+	// syncing the savepoint to disk, ledger recovery process kicks in to ensure consistency
+	// between CouchDB and block store on peer restart
 
 	return nil
 }
@@ -616,7 +958,7 @@ func (vdb *VersionedDB) recordSavepoint(height *version.Height) error {
 func (vdb *VersionedDB) GetLatestSavePoint() (*version.Height, error) {
 
 	var err error
-	couchDoc, _, err := vdb.db.ReadDoc(savepointDocID)
+	couchDoc, _, err := vdb.metadataDB.ReadDoc(savepointDocID)
 	if err != nil {
 		logger.Errorf("Failed to read savepoint data %s\n", err.Error())
 		return nil, err
@@ -637,6 +979,7 @@ func (vdb *VersionedDB) GetLatestSavePoint() (*version.Height, error) {
 	return &version.Height{BlockNum: savepointDoc.BlockNum, TxNum: savepointDoc.TxNum}, nil
 }
 
+/*
 func constructCompositeKey(ns string, key string) []byte {
 	compositeKey := []byte(ns)
 	compositeKey = append(compositeKey, compositeKeySep...)
@@ -648,6 +991,7 @@ func splitCompositeKey(compositeKey []byte) (string, string) {
 	split := bytes.SplitN(compositeKey, compositeKeySep, 2)
 	return string(split[0]), string(split[1])
 }
+*/
 
 type kvScanner struct {
 	cursor    int
@@ -669,7 +1013,7 @@ func (scanner *kvScanner) Next() (statedb.QueryResult, error) {
 
 	selectedKV := scanner.results[scanner.cursor]
 
-	_, key := splitCompositeKey([]byte(selectedKV.ID))
+	key := selectedKV.ID
 
 	// remove the data wrapper and return the value and version
 	returnValue, returnVersion := removeDataWrapper(selectedKV.Value, selectedKV.Attachments)
@@ -684,12 +1028,13 @@ func (scanner *kvScanner) Close() {
 }
 
 type queryScanner struct {
-	cursor  int
-	results []couchdb.QueryResult
+	cursor    int
+	namespace string
+	results   []couchdb.QueryResult
 }
 
-func newQueryScanner(queryResults []couchdb.QueryResult) *queryScanner {
-	return &queryScanner{-1, queryResults}
+func newQueryScanner(namespace string, queryResults []couchdb.QueryResult) *queryScanner {
+	return &queryScanner{-1, namespace, queryResults}
 }
 
 func (scanner *queryScanner) Next() (statedb.QueryResult, error) {
@@ -702,13 +1047,13 @@ func (scanner *queryScanner) Next() (statedb.QueryResult, error) {
 
 	selectedResultRecord := scanner.results[scanner.cursor]
 
-	namespace, key := splitCompositeKey([]byte(selectedResultRecord.ID))
+	key := selectedResultRecord.ID
 
 	// remove the data wrapper and return the value and version
 	returnValue, returnVersion := removeDataWrapper(selectedResultRecord.Value, selectedResultRecord.Attachments)
 
 	return &statedb.VersionedKV{
-		CompositeKey:   statedb.CompositeKey{Namespace: namespace, Key: key},
+		CompositeKey:   statedb.CompositeKey{Namespace: scanner.namespace, Key: key},
 		VersionedValue: statedb.VersionedValue{Value: returnValue, Version: returnVersion}}, nil
 }
 

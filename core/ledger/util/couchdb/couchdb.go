@@ -38,6 +38,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hyperledger/fabric/common/flogging"
+	"github.com/hyperledger/fabric/core/ledger/ledgerconfig"
 	logging "github.com/op/go-logging"
 )
 
@@ -202,6 +203,27 @@ type Base64Attachment struct {
 	AttachmentData string `json:"data"`
 }
 
+//ListIndexResponse contains the definition for listing couchdb indexes
+type ListIndexResponse struct {
+	TotalRows int               `json:"total_rows"`
+	Indexes   []IndexDefinition `json:"indexes"`
+}
+
+//IndexDefinition contains the definition for a couchdb index
+type IndexDefinition struct {
+	DesignDocument string          `json:"ddoc"`
+	Name           string          `json:"name"`
+	Type           string          `json:"type"`
+	Definition     json.RawMessage `json:"def"`
+}
+
+//IndexResult contains the definition for a couchdb index
+type IndexResult struct {
+	DesignDocument string `json:"designdoc"`
+	Name           string `json:"name"`
+	Definition     string `json:"definition"`
+}
+
 // closeResponseBody discards the body and then closes it to enable returning it to
 // connection pool
 func closeResponseBody(resp *http.Response) {
@@ -274,7 +296,7 @@ func (dbclient *CouchDatabase) CreateDatabaseIfNotExist() (*DBOperationResponse,
 		json.NewDecoder(resp.Body).Decode(&dbResponse)
 
 		if dbResponse.Ok == true {
-			logger.Debugf("Created database %s ", dbclient.DBName)
+			logger.Infof("Created state database %s", dbclient.DBName)
 		}
 
 		logger.Debugf("Exiting CreateDatabaseIfNotExist()")
@@ -362,7 +384,6 @@ func (couchInstance *CouchInstance) VerifyCouchConfig() (*ConnectionInfo, *DBRet
 			logger.Debugf("VerifyConnection() dbResponseJSON: %s", dbResponseJSON)
 		}
 	}
-
 	//check to see if the system databases exist
 	//Verifying the existence of the system database accomplishes two steps
 	//1.  Ensures the system databases are created
@@ -443,6 +464,14 @@ func (dbclient *CouchDatabase) EnsureFullCommit() (*DBOperationResponse, error) 
 
 	if dbResponse.Ok == true {
 		logger.Debugf("_ensure_full_commit database %s ", dbclient.DBName)
+	}
+
+	//Check to see if autoWarmIndexes is enabled
+	//If autoWarmIndexes is enabled, indexes will be refreshed after each block's
+	//data has been committed to the state database
+	if ledgerconfig.IsAutoWarmIndexesEnabled() {
+		//Use a go routine to launch WarmIndexAllIndexes(), this will execute as a background process
+		go dbclient.runWarmIndexAllIndexes()
 	}
 
 	logger.Debugf("Exiting EnsureFullCommit()")
@@ -1006,6 +1035,194 @@ func (dbclient *CouchDatabase) QueryDocuments(query string) (*[]QueryResult, err
 
 }
 
+// ListIndex method lists the defined indexes for a database
+func (dbclient *CouchDatabase) ListIndex() (*[]IndexResult, error) {
+
+	logger.Debugf("Entering ListIndex()")
+
+	indexURL, err := url.Parse(dbclient.CouchInstance.conf.URL)
+	if err != nil {
+		logger.Errorf("URL parse error: %s", err.Error())
+		return nil, err
+	}
+
+	indexURL.Path = dbclient.DBName + "/_index/"
+
+	//get the number of retries
+	maxRetries := dbclient.CouchInstance.conf.MaxRetries
+
+	resp, _, err := dbclient.CouchInstance.handleRequest(http.MethodGet, indexURL.String(), nil, "", "", maxRetries, true)
+	if err != nil {
+		return nil, err
+	}
+	defer closeResponseBody(resp)
+
+	//handle as JSON document
+	jsonResponseRaw, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var jsonResponse = &ListIndexResponse{}
+
+	err2 := json.Unmarshal(jsonResponseRaw, &jsonResponse)
+	if err2 != nil {
+		return nil, err2
+	}
+
+	var results []IndexResult
+
+	for _, row := range jsonResponse.Indexes {
+
+		//if the DesignDocument does not begin with "_design/", then this is a system
+		//level index and is not meaningful and cannot be edited or deleted
+		designDoc := row.DesignDocument
+		s := strings.SplitAfterN(designDoc, "_design/", 2)
+		if len(s) > 1 {
+			designDoc = s[1]
+
+			//Add the index definition to the results
+			var addIndexResult = &IndexResult{DesignDocument: designDoc, Name: row.Name, Definition: fmt.Sprintf("%s", row.Definition)}
+			results = append(results, *addIndexResult)
+		}
+
+	}
+
+	logger.Debugf("Exiting ListIndex()")
+
+	return &results, nil
+
+}
+
+// CreateIndex method provides a function creating an index
+func (dbclient *CouchDatabase) CreateIndex(indexdefinition string) error {
+
+	logger.Debugf("Entering CreateIndex()  indexdefinition=%s", indexdefinition)
+
+	//Test to see if this is a valid JSON
+	if IsJSON(indexdefinition) != true {
+		return fmt.Errorf("JSON format is not valid")
+	}
+
+	indexURL, err := url.Parse(dbclient.CouchInstance.conf.URL)
+	if err != nil {
+		logger.Errorf("URL parse error: %s", err.Error())
+		return err
+	}
+
+	indexURL.Path = dbclient.DBName + "/_index"
+
+	//get the number of retries
+	maxRetries := dbclient.CouchInstance.conf.MaxRetries
+
+	resp, _, err := dbclient.CouchInstance.handleRequest(http.MethodPost, indexURL.String(), []byte(indexdefinition), "", "", maxRetries, true)
+	if err != nil {
+		return err
+	}
+	defer closeResponseBody(resp)
+
+	logger.Infof("Created CouchDB index in state database %s", dbclient.DBName)
+
+	return nil
+
+}
+
+// DeleteIndex method provides a function deleting an index
+func (dbclient *CouchDatabase) DeleteIndex(designdoc, indexname string) error {
+
+	logger.Debugf("Entering DeleteIndex()  designdoc=%s  indexname=%s", designdoc, indexname)
+
+	indexURL, err := url.Parse(dbclient.CouchInstance.conf.URL)
+	if err != nil {
+		logger.Errorf("URL parse error: %s", err.Error())
+		return err
+	}
+
+	indexURL.Path = dbclient.DBName + "/_index/" + designdoc + "/json/" + indexname
+
+	//get the number of retries
+	maxRetries := dbclient.CouchInstance.conf.MaxRetries
+
+	resp, _, err := dbclient.CouchInstance.handleRequest(http.MethodDelete, indexURL.String(), nil, "", "", maxRetries, true)
+	if err != nil {
+		return err
+	}
+	defer closeResponseBody(resp)
+
+	return nil
+
+}
+
+//WarmIndex method provides a function for warming a single index
+func (dbclient *CouchDatabase) WarmIndex(designdoc, indexname string) error {
+
+	logger.Debugf("Entering WarmIndex()  designdoc=%s  indexname=%s", designdoc, indexname)
+
+	indexURL, err := url.Parse(dbclient.CouchInstance.conf.URL)
+	if err != nil {
+		logger.Errorf("URL parse error: %s", err.Error())
+		return err
+	}
+
+	//URL to execute the view function associated with the index
+	indexURL.Path = dbclient.DBName + "/_design/" + designdoc + "/_view/" + indexname
+
+	queryParms := indexURL.Query()
+	//Query parameter that allows the execution of the URL to return immediately
+	//The update_after will cause the index update to run after the URL returns
+	queryParms.Add("stale", "update_after")
+	indexURL.RawQuery = queryParms.Encode()
+
+	//get the number of retries
+	maxRetries := dbclient.CouchInstance.conf.MaxRetries
+
+	resp, _, err := dbclient.CouchInstance.handleRequest(http.MethodGet, indexURL.String(), nil, "", "", maxRetries, true)
+	if err != nil {
+		return err
+	}
+	defer closeResponseBody(resp)
+
+	return nil
+
+}
+
+//runWarmIndexAllIndexes is a wrapper for WarmIndexAllIndexes to catch and report any errors
+func (dbclient *CouchDatabase) runWarmIndexAllIndexes() {
+
+	err := dbclient.WarmIndexAllIndexes()
+	if err != nil {
+		logger.Errorf("Error detected during WarmIndexAllIndexes(): %s", err.Error())
+	}
+
+}
+
+//WarmIndexAllIndexes method provides a function for warming all indexes for a database
+func (dbclient *CouchDatabase) WarmIndexAllIndexes() error {
+
+	logger.Debugf("Entering WarmIndexAllIndexes()")
+
+	//Retrieve all indexes
+	listResult, err := dbclient.ListIndex()
+	if err != nil {
+		return err
+	}
+
+	//For each index definition, execute an index refresh
+	for _, elem := range *listResult {
+
+		err := dbclient.WarmIndex(elem.DesignDocument, elem.Name)
+		if err != nil {
+			return err
+		}
+
+	}
+
+	logger.Debugf("Exiting WarmIndexAllIndexes()")
+
+	return nil
+
+}
+
 //BatchRetrieveDocumentMetadata - batch method to retrieve document metadata for  a set of keys,
 // including ID, couchdb revision number, and ledger version
 func (dbclient *CouchDatabase) BatchRetrieveDocumentMetadata(keys []string) ([]*DocMetadata, error) {
@@ -1407,13 +1624,22 @@ func IsJSON(s string) bool {
 	return json.Unmarshal([]byte(s), &js) == nil
 }
 
-// encodePathElement uses Golang for encoding and in addition, replaces a '/' by %2F.
-// Otherwise, in the regular encoding, a '/' is treated as a path separator in the url
+// encodePathElement uses Golang for url path encoding, additionally:
+// '/' is replaced by %2F, otherwise path encoding will treat as path separator and ignore it
+// '+' is replaced by %2B, otherwise path encoding will ignore it, while CouchDB will unencode the plus as a space
+// Note that all other URL special characters have been tested successfully without need for special handling
 func encodePathElement(str string) string {
+
+	logger.Debugf("Entering encodePathElement()  string=%s", str)
+
 	u := &url.URL{}
 	u.Path = str
-	encodedStr := u.String()
+	encodedStr := u.EscapedPath() // url encode using golang url path encoding rules
 	encodedStr = strings.Replace(encodedStr, "/", "%2F", -1)
+	encodedStr = strings.Replace(encodedStr, "+", "%2B", -1)
+
+	logger.Debugf("Exiting encodePathElement()  encodedStr=%s", encodedStr)
+
 	return encodedStr
 }
 

@@ -31,39 +31,58 @@ func NewValidator(db privacyenabledstate.DB) *Validator {
 
 // preLoadCommittedVersionOfRSet loads committed version of all keys in each
 // transaction's read set into a cache.
-func (v *Validator) preLoadCommittedVersionOfRSet(block *valinternal.Block) {
+func (v *Validator) preLoadCommittedVersionOfRSet(block *valinternal.Block) error {
 
-	// Collect read set of all transactions in a given block
-	var readSetKeys []*statedb.CompositeKey
+	// Collect both public and hashed keys in read sets of all transactions in a given block
+	var pubKeys []*statedb.CompositeKey
+	var hashedKeys []*privacyenabledstate.HashedCompositeKey
+
+	// pubKeysMap and hashedKeysMap are used to avoid duplicate entries in the
+	// pubKeys and hashedKeys. Though map alone can be used to collect keys in
+	// read sets and pass as an argument in LoadCommittedVersionOfPubAndHashedKeys(),
+	// array is used for better code readability. On the negative side, this approach
+	// might use some extra memory.
+	pubKeysMap := make(map[statedb.CompositeKey]interface{})
+	hashedKeysMap := make(map[privacyenabledstate.HashedCompositeKey]interface{})
+
 	for _, tx := range block.Txs {
 		for _, nsRWSet := range tx.RWSet.NsRwSets {
 			for _, kvRead := range nsRWSet.KvRwSet.Reads {
-				readSetKeys = append(readSetKeys, &statedb.CompositeKey{
+				compositeKey := statedb.CompositeKey{
 					Namespace: nsRWSet.NameSpace,
 					Key:       kvRead.Key,
-				})
+				}
+				if _, ok := pubKeysMap[compositeKey]; !ok {
+					pubKeysMap[compositeKey] = nil
+					pubKeys = append(pubKeys, &compositeKey)
+				}
+
 			}
 			for _, colHashedRwSet := range nsRWSet.CollHashedRwSets {
 				for _, kvHashedRead := range colHashedRwSet.HashedRwSet.HashedReads {
-					ns, key := v.db.GetHashedDataNsAndKeyHashStr(nsRWSet.NameSpace, colHashedRwSet.CollectionName,
-						kvHashedRead.KeyHash)
-					readSetKeys = append(readSetKeys, &statedb.CompositeKey{
-						Namespace: ns,
-						Key:       key,
-					})
+					hashedCompositeKey := privacyenabledstate.HashedCompositeKey{
+						Namespace:      nsRWSet.NameSpace,
+						CollectionName: colHashedRwSet.CollectionName,
+						KeyHash:        string(kvHashedRead.KeyHash),
+					}
+					if _, ok := hashedKeysMap[hashedCompositeKey]; !ok {
+						hashedKeysMap[hashedCompositeKey] = nil
+						hashedKeys = append(hashedKeys, &hashedCompositeKey)
+					}
 				}
 			}
 		}
 	}
 
 	// Load committed version of all keys into a cache
-	if len(readSetKeys) > 0 {
-		commonStorageDB := v.db.(*privacyenabledstate.CommonStorageDB)
-		bulkOptimizable, ok := commonStorageDB.VersionedDB.(statedb.BulkOptimizable)
-		if ok {
-			bulkOptimizable.LoadCommittedVersions(readSetKeys)
+	if len(pubKeys) > 0 || len(hashedKeys) > 0 {
+		err := v.db.LoadCommittedVersionsOfPubAndHashedKeys(pubKeys, hashedKeys)
+		if err != nil {
+			return err
 		}
 	}
+
+	return nil
 }
 
 // ValidateAndPrepareBatch implements method in Validator interface
@@ -71,10 +90,11 @@ func (v *Validator) ValidateAndPrepareBatch(block *valinternal.Block, doMVCCVali
 	// Check whether statedb implements BulkOptimizable interface. For now,
 	// only CouchDB implements BulkOptimizable to reduce the number of REST
 	// API calls from peer to CouchDB instance.
-	commonStorageDB := v.db.(*privacyenabledstate.CommonStorageDB)
-	_, ok := commonStorageDB.VersionedDB.(statedb.BulkOptimizable)
-	if ok {
-		v.preLoadCommittedVersionOfRSet(block)
+	if v.db.IsBulkOptimizable() {
+		err := v.preLoadCommittedVersionOfRSet(block)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	updates := valinternal.NewPubAndHashUpdates()
@@ -98,7 +118,7 @@ func (v *Validator) ValidateAndPrepareBatch(block *valinternal.Block, doMVCCVali
 	return updates, nil
 }
 
-//validate endorser transaction
+// validateEndorserTX validates endorser transaction
 func (v *Validator) validateEndorserTX(
 	txRWSet *rwsetutil.TxRwSet,
 	doMVCCValidation bool,
@@ -167,7 +187,7 @@ func (v *Validator) validateKVRead(ns string, kvRead *kvrwset.KVRead, updates *p
 		return false, err
 	}
 
-	logger.Debugf("Comapring versions for key [%s]: committed version=%#v and read version=%#v",
+	logger.Debugf("Comparing versions for key [%s]: committed version=%#v and read version=%#v",
 		kvRead.Key, committedVersion, rwsetutil.NewVersion(kvRead.Version))
 	if !version.AreSame(committedVersion, rwsetutil.NewVersion(kvRead.Version)) {
 		logger.Debugf("Version mismatch for key [%s:%s]. Committed version = [%#v], Version in readSet [%#v]",
@@ -189,7 +209,7 @@ func (v *Validator) validateRangeQueries(ns string, rangeQueriesInfo []*kvrwset.
 	return true, nil
 }
 
-// validateRangeQuery performs a phatom read check i.e., it
+// validateRangeQuery performs a phantom read check i.e., it
 // checks whether the results of the range query are still the same when executed on the
 // statedb (latest state as of last committed block) + updates (prepared by the writes of preceding valid transactions
 // in the current block and yet to be committed as part of group commit at the end of the validation of the block)
@@ -250,8 +270,7 @@ func (v *Validator) validateKVReadHash(ns, coll string, kvReadHash *kvrwset.KVRe
 	if updates.Contains(ns, coll, kvReadHash.KeyHash) {
 		return false, nil
 	}
-	ns, key := v.db.GetHashedDataNsAndKeyHashStr(ns, coll, kvReadHash.KeyHash)
-	committedVersion, err := v.db.GetVersion(ns, key)
+	committedVersion, err := v.db.GetKeyHashVersion(ns, coll, kvReadHash.KeyHash)
 	if err != nil {
 		return false, err
 	}

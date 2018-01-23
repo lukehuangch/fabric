@@ -11,10 +11,9 @@ import (
 
 	newchannelconfig "github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
-	configtxapi "github.com/hyperledger/fabric/common/configtx/api"
 	"github.com/hyperledger/fabric/common/crypto"
+	"github.com/hyperledger/fabric/common/ledger/blockledger"
 	"github.com/hyperledger/fabric/common/util"
-	"github.com/hyperledger/fabric/orderer/common/ledger"
 	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protos/utils"
 
@@ -23,8 +22,8 @@ import (
 
 type blockWriterSupport interface {
 	crypto.LocalSigner
-	ledger.ReadWriter
-	configtxapi.Manager
+	blockledger.ReadWriter
+	configtx.Validator
 	Update(*newchannelconfig.Bundle)
 	CreateBundle(channelID string, config *cb.Config) (*newchannelconfig.Bundle, error)
 }

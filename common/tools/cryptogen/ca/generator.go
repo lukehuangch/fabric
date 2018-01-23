@@ -22,13 +22,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
-	"path/filepath"
-
+	"github.com/hyperledger/fabric/bccsp/utils"
 	"github.com/hyperledger/fabric/common/tools/cryptogen/csp"
 )
 
@@ -170,23 +172,27 @@ func subjectTemplateAdditional(country, province, locality, orgUnit, streetAddre
 // default template for X509 certificates
 func x509Template() x509.Certificate {
 
-	//generate a serial number
+	// generate a serial number
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, _ := rand.Int(rand.Reader, serialNumberLimit)
 
-	now := time.Now()
+	// set expiry to around 10 years
+	expiry := 3650 * 24 * time.Hour
+	// backdate 5 min
+	notBefore := time.Now().Add(-5 * time.Minute).UTC()
+
 	//basic template to use
 	x509 := x509.Certificate{
 		SerialNumber:          serialNumber,
-		NotBefore:             now,
-		NotAfter:              now.Add(3650 * 24 * time.Hour), //~ten years
+		NotBefore:             notBefore,
+		NotAfter:              notBefore.Add(expiry).UTC(),
 		BasicConstraintsValid: true,
 	}
 	return x509
 
 }
 
-// generate a signed X509 certficate using ECDSA
+// generate a signed X509 certificate using ECDSA
 func genCertificateECDSA(baseDir, name string, template, parent *x509.Certificate, pub *ecdsa.PublicKey,
 	priv interface{}) (*x509.Certificate, error) {
 
@@ -214,4 +220,29 @@ func genCertificateECDSA(baseDir, name string, template, parent *x509.Certificat
 		return nil, err
 	}
 	return x509Cert, nil
+}
+
+// LoadCertificateECDSA load a ecdsa cert from a file in cert path
+func LoadCertificateECDSA(certPath string) (*x509.Certificate, error) {
+	var cert *x509.Certificate
+	var err error
+
+	walkFunc := func(path string, info os.FileInfo, err error) error {
+		if strings.HasSuffix(path, ".pem") {
+			rawCert, err := ioutil.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			block, _ := pem.Decode(rawCert)
+			cert, err = utils.DERToX509Certificate(block.Bytes)
+		}
+		return nil
+	}
+
+	err = filepath.Walk(certPath, walkFunc)
+	if err != nil {
+		return nil, err
+	}
+
+	return cert, err
 }
